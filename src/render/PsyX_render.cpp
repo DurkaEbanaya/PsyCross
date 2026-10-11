@@ -14,6 +14,7 @@
 #include <algorithm>
 #if defined(__ANDROID__)
 #include <dlfcn.h>
+#include <jni.h>
 #endif
 
 #include "PsyX/PsyX_public.h"
@@ -7275,38 +7276,91 @@ static void GreyFrame_Present(int w, int h)
 }
 
 #if defined(__ANDROID__)
-/* [SWAPDIAG] One-shot: the app's own logcat lines from SDL's Java side around
- * the moment the window surface was replaced. SDLSurface logs
- * surfaceDestroyed()/surfaceCreated()/surfaceChanged() under the SDL tag, and
- * SDLActivity logs its pause/resume decisions there too, so this names what
- * Android actually did -- which the game cannot otherwise see, because no
- * SDL event is sent for a surface that is replaced without a pause. A process
- * may read its own log lines without any permission. Runs once. */
-static void Swap_CaptureLogcatOnce(void)
+/* [SWAPDIAG] Ask Android, through the port's own activity, what it thinks the
+ * display and our window are doing. logcat cannot be read on the cabinet's
+ * firmware (exec denied), and no SDL event exists for a window abandoned
+ * without a pause, so this is the one remaining way to see it. The SDL main
+ * thread is Java-created, so its class loader can find the app's classes. */
+static void Swap_LogAndroidState(const char* why)
 {
-	static int done = 0;
-	FILE*      lc;
-	char       line[512];
-	int        n = 0;
+	JNIEnv*   env = (JNIEnv*)SDL_AndroidGetJNIEnv();
+	jclass    cls;
+	jmethodID mid;
+	jstring   js;
 
-	if (done)
-		return;
-	done = 1;
-
-	lc = popen("/system/bin/logcat -d -t 600 -v time", "r");
-	if (lc == NULL)
+	if (env == NULL)
 	{
-		eprintwarn("[SWAPDIAG] logcat not readable\n");
+		eprintwarn("[SWAPDIAG] android state (%s): no JNI env\n", why);
 		return;
 	}
-	eprintwarn("[SWAPDIAG] ---- logcat, this process, around the first failed swap ----\n");
-	while (n < 500 && fgets(line, (int)sizeof(line), lc) != NULL)
+	cls = env->FindClass("com/silenthill/port/SilentHillActivity");
+	if (cls == NULL)
 	{
-		eprintwarn("[LOGCAT] %s", line);
-		n++;
+		env->ExceptionClear();
+		eprintwarn("[SWAPDIAG] android state (%s): activity class not found\n", why);
+		return;
 	}
-	pclose(lc);
-	eprintwarn("[SWAPDIAG] ---- end logcat (%d lines) ----\n", n);
+	mid = env->GetStaticMethodID(cls, "shDisplayState", "()Ljava/lang/String;");
+	if (mid == NULL)
+	{
+		env->ExceptionClear();
+		env->DeleteLocalRef(cls);
+		eprintwarn("[SWAPDIAG] android state (%s): shDisplayState missing\n", why);
+		return;
+	}
+	js = (jstring)env->CallStaticObjectMethod(cls, mid);
+	if (env->ExceptionCheck())
+	{
+		env->ExceptionClear();
+		js = NULL;
+	}
+	if (js != NULL)
+	{
+		const char* str = env->GetStringUTFChars(js, NULL);
+
+		if (str != NULL)
+		{
+			eprintwarn("[SWAPDIAG] android state (%s): %s\n", why, str);
+			env->ReleaseStringUTFChars(js, str);
+		}
+		env->DeleteLocalRef(js);
+	}
+	env->DeleteLocalRef(cls);
+}
+
+/* Ask the activity to drop and rebuild the SurfaceView's window. SDL's
+ * surfaceDestroyed/surfaceCreated path then pauses the app, backs the context
+ * up, builds a fresh EGL surface on the new window, and restores -- the only
+ * cure once the old window has been abandoned underneath us. The game loop
+ * idles while g_PsyX_AppPaused is set, so no GL call lands while the context
+ * is un-made current. */
+static void Swap_RequestSurfaceRecreate(void)
+{
+	JNIEnv*   env = (JNIEnv*)SDL_AndroidGetJNIEnv();
+	jclass    cls;
+	jmethodID mid;
+
+	if (env == NULL)
+		return;
+	cls = env->FindClass("com/silenthill/port/SilentHillActivity");
+	if (cls == NULL)
+	{
+		env->ExceptionClear();
+		return;
+	}
+	mid = env->GetStaticMethodID(cls, "shRecreateSurface", "()V");
+	if (mid != NULL)
+	{
+		env->CallStaticVoidMethod(cls, mid);
+		if (env->ExceptionCheck())
+			env->ExceptionClear();
+		eprintwarn("[SWAPDIAG] requested a new window surface\n");
+	}
+	else
+	{
+		env->ExceptionClear();
+	}
+	env->DeleteLocalRef(cls);
 }
 #endif
 
@@ -7468,7 +7522,7 @@ void GR_SwapWindow()
 					eprintwarn("[SWAPDIAG] window surface replaced (%p -> %p); context rebound\n",
 						s_boundSurface, cur);
 					s_boundSurface = cur;
-					Swap_CaptureLogcatOnce();
+					Swap_LogAndroidState("surface replaced");
 				}
 				else
 				{
@@ -7487,6 +7541,7 @@ void GR_SwapWindow()
 			int         eglErr  = 0;
 			static int  s_swapBad = 0;
 			static int  s_rebindOk = 0;
+			static unsigned s_nextRecreateMs = 0;
 
 			/* SDL_GL_SwapWindow returns void and swallows the platform
 			 * result, so presentation can stop working in complete
@@ -7565,8 +7620,17 @@ void GR_SwapWindow()
 						           " querySurface(ok=%u width=%d err=0x%04X)\n",
 						           sdlSurf, curDraw, (void*)wm.info.android.window,
 						           qok, w, (unsigned)qerr);
-						Swap_CaptureLogcatOnce();
+						Swap_LogAndroidState("first failed swap");
 					}
+				}
+
+				/* Recovery: a fresh window. Immediately on the first failure, then
+				 * every ten seconds for as long as presentation stays dead, so a
+				 * display that comes back later still gets picked up. */
+				if (nowMs >= s_nextRecreateMs)
+				{
+					Swap_RequestSurfaceRecreate();
+					s_nextRecreateMs = nowMs + 10000u;
 				}
 
 				/* Then try to recover, every failed frame: unbind so SDL cannot
@@ -7599,12 +7663,15 @@ void GR_SwapWindow()
 						s_rebindOk ? "ok" : "failed");
 					s_swapHits   = 0;
 					s_nextSwapMs = nowMs + 3000u;
+					Swap_LogAndroidState("still failing");
 				}
 			}
 			else if (s_swapBad)
 			{
 				s_swapBad = 0;
+				s_nextRecreateMs = 0;
 				eprintwarn("[SWAPDIAG] presentation recovered\n");
+				Swap_LogAndroidState("recovered");
 			}
 		}
 	}

@@ -942,6 +942,17 @@ int g_PsyX_WheelDownFrames = 0;
  *
  * Honouring it costs nothing on desktop, where these events never arrive. */
 extern "C" { int g_PsyX_AppPaused = 0; }
+/* While Android has the window (backgrounded, or the surface being rebuilt)
+ * SDL has un-made the GL context current on this thread, so the game loop
+ * must not build a frame. It calls this instead: pump events so the resume
+ * is seen, then yield. */
+void PsyX_Sys_DoPollEvent();
+extern "C" void PsyX_PauseIdle(void)
+{
+	PsyX_Sys_DoPollEvent();
+	SDL_Delay(16);
+}
+
 void PsyX_Sys_DoPollEvent()
 {
 	SDL_Event event;

@@ -7542,6 +7542,7 @@ void GR_SwapWindow()
 			static int  s_swapBad = 0;
 			static int  s_rebindOk = 0;
 			static unsigned s_nextRecreateMs = 0;
+			static int      s_recreateTries  = 0;
 
 			/* SDL_GL_SwapWindow returns void and swallows the platform
 			 * result, so presentation can stop working in complete
@@ -7624,13 +7625,28 @@ void GR_SwapWindow()
 					}
 				}
 
-				/* Recovery: a fresh window. Immediately on the first failure, then
-				 * every ten seconds for as long as presentation stays dead, so a
-				 * display that comes back later still gets picked up. */
-				if (nowMs >= s_nextRecreateMs)
+				/* Recovery: a fresh window, three tries two seconds apart. The first
+				 * one works when the display pipeline is still alive. Once the
+				 * cabinet has parked it there is no vsync, so the view system cannot
+				 * even lay out a hidden-then-shown SurfaceView, and eight requests in
+				 * one log produced one real rebuild -- the rest only hid and showed
+				 * the view, which is the likeliest source of the reported green
+				 * border. So this stops, says why, and leaves it to the poke in
+				 * SilentHillActivity to keep the pipeline from parking at all. */
+				if (s_recreateTries < 3)
 				{
-					Swap_RequestSurfaceRecreate();
-					s_nextRecreateMs = nowMs + 10000u;
+					if (nowMs >= s_nextRecreateMs)
+					{
+						Swap_RequestSurfaceRecreate();
+						s_recreateTries++;
+						s_nextRecreateMs = nowMs + 2000u;
+					}
+				}
+				else if (s_recreateTries == 3)
+				{
+					s_recreateTries = 4;
+					eprintwarn("[SWAPDIAG] giving up on recreation: the display pipeline is parked by the system; "
+					           "only a display power transition can wake it\n");
 				}
 
 				/* Then try to recover, every failed frame: unbind so SDL cannot
@@ -7670,6 +7686,7 @@ void GR_SwapWindow()
 			{
 				s_swapBad = 0;
 				s_nextRecreateMs = 0;
+				s_recreateTries  = 0;
 				eprintwarn("[SWAPDIAG] presentation recovered\n");
 				Swap_LogAndroidState("recovered");
 			}

@@ -12,10 +12,6 @@
 #include <vector>
 #include <utility>
 #include <algorithm>
-#if defined(__ANDROID__)
-#include <dlfcn.h>
-#include <jni.h>
-#endif
 
 #include "PsyX/PsyX_public.h"
 
@@ -30,10 +26,6 @@
 
 #if defined(_WIN32) && defined(RENDERER_OGL)
 /* For the HWND that the ANGLE/EGL surface is created against. */
-#   include <SDL_syswm.h>
-#endif
-#if defined(__ANDROID__)
-/* For the live EGL surface handle: the swap watches it for replacement. */
 #   include <SDL_syswm.h>
 #endif
 
@@ -7275,95 +7267,6 @@ static void GreyFrame_Present(int w, int h)
 	memset(&s_gf, 0, sizeof(s_gf));
 }
 
-#if defined(__ANDROID__)
-/* [SWAPDIAG] Ask Android, through the port's own activity, what it thinks the
- * display and our window are doing. logcat cannot be read on the cabinet's
- * firmware (exec denied), and no SDL event exists for a window abandoned
- * without a pause, so this is the one remaining way to see it. The SDL main
- * thread is Java-created, so its class loader can find the app's classes. */
-static void Swap_LogAndroidState(const char* why)
-{
-	JNIEnv*   env = (JNIEnv*)SDL_AndroidGetJNIEnv();
-	jclass    cls;
-	jmethodID mid;
-	jstring   js;
-
-	if (env == NULL)
-	{
-		eprintwarn("[SWAPDIAG] android state (%s): no JNI env\n", why);
-		return;
-	}
-	cls = env->FindClass("com/silenthill/port/SilentHillActivity");
-	if (cls == NULL)
-	{
-		env->ExceptionClear();
-		eprintwarn("[SWAPDIAG] android state (%s): activity class not found\n", why);
-		return;
-	}
-	mid = env->GetStaticMethodID(cls, "shDisplayState", "()Ljava/lang/String;");
-	if (mid == NULL)
-	{
-		env->ExceptionClear();
-		env->DeleteLocalRef(cls);
-		eprintwarn("[SWAPDIAG] android state (%s): shDisplayState missing\n", why);
-		return;
-	}
-	js = (jstring)env->CallStaticObjectMethod(cls, mid);
-	if (env->ExceptionCheck())
-	{
-		env->ExceptionClear();
-		js = NULL;
-	}
-	if (js != NULL)
-	{
-		const char* str = env->GetStringUTFChars(js, NULL);
-
-		if (str != NULL)
-		{
-			eprintwarn("[SWAPDIAG] android state (%s): %s\n", why, str);
-			env->ReleaseStringUTFChars(js, str);
-		}
-		env->DeleteLocalRef(js);
-	}
-	env->DeleteLocalRef(cls);
-}
-
-/* Ask the activity to drop and rebuild the SurfaceView's window. SDL's
- * surfaceDestroyed/surfaceCreated path then pauses the app, backs the context
- * up, builds a fresh EGL surface on the new window, and restores -- the only
- * cure once the old window has been abandoned underneath us. The game loop
- * idles while g_PsyX_AppPaused is set, so no GL call lands while the context
- * is un-made current. */
-static void Swap_RequestSurfaceRecreate(void)
-{
-	JNIEnv*   env = (JNIEnv*)SDL_AndroidGetJNIEnv();
-	jclass    cls;
-	jmethodID mid;
-
-	if (env == NULL)
-		return;
-	cls = env->FindClass("com/silenthill/port/SilentHillActivity");
-	if (cls == NULL)
-	{
-		env->ExceptionClear();
-		return;
-	}
-	mid = env->GetStaticMethodID(cls, "shRecreateSurface", "()V");
-	if (mid != NULL)
-	{
-		env->CallStaticVoidMethod(cls, mid);
-		if (env->ExceptionCheck())
-			env->ExceptionClear();
-		eprintwarn("[SWAPDIAG] requested a new window surface\n");
-	}
-	else
-	{
-		env->ExceptionClear();
-	}
-	env->DeleteLocalRef(cls);
-}
-#endif
-
 void GR_SwapWindow()
 {
 	{
@@ -7449,260 +7352,17 @@ void GR_SwapWindow()
 	{
 		GreyFrame_Present(g_internalFBO ? g_presentWidth : g_windowWidth,
 		                  g_internalFBO ? g_presentHeight : g_windowHeight);
-		/* [SWAPDIAG] The cabinet freezes with GL reporting no errors, frames
-		 * still pacing to vblank and the game still running -- which says the
-		 * picture stops reaching the screen rather than the renderer stopping.
-		 * SDL_GL_SwapWindow returns void, so the only report is SDL's error
-		 * string; clear it first so anything found here belongs to the swap.
-		 * Rate-limited, and silent unless something is actually wrong. */
 		{
-			/* Android has the surface; presenting now is what breaks it. */
+			/* Android owns the surface while the app is in the background, and
+			 * SDL has made the context non-current on this thread; presenting
+			 * then fails or breaks the surface. */
 			extern int g_PsyX_AppPaused;
 
 			if (g_PsyX_AppPaused)
 				return;
 		}
 
-#if defined(__ANDROID__)
-		/* Re-bind the context when Android has replaced the window surface.
-		 *
-		 * The cabinet freeze, finally read out of SDL rather than guessed at.
-		 * Android destroyed and recreated the SurfaceView surface WITHOUT pausing
-		 * the activity (no SDL_APP_* event ever arrived -- verified). SDL's
-		 * onNativeSurfaceDestroyed waits 500 ms for a pause handshake that never
-		 * comes, then destroys the old EGL surface anyway while this thread still
-		 * has it current; onNativeSurfaceCreated/Changed then build a NEW one.
-		 * But the step that makes the new surface current on this thread,
-		 * android_egl_context_restore, lives only on the resume path, which never
-		 * runs without a pause. So eglSwapBuffers is handed a surface that is not
-		 * bound to the calling thread, which is precisely EGL_BAD_SURFACE, on
-		 * every frame from then on. GL itself keeps working into the dead surface
-		 * (no GL errors), the compositor keeps the last frame it got, and the game
-		 * runs on underneath -- exactly what was reported.
-		 *
-		 * Why the earlier rebind attempt could not work: SDL_GL_MakeCurrent
-		 * returns early when the window AND context are unchanged ("already
-		 * current"), and both were unchanged -- only the surface underneath moved.
-		 * SDL's own restore therefore unbinds with MakeCurrent(window, NULL) first;
-		 * that is the step this does too.
-		 *
-		 * Watched every frame via SDL_GetWindowWMInfo, which hands back the live
-		 * egl_surface, so the replacement is caught before a swap ever fails. The
-		 * context survives the whole thing (eglDestroySurface never touches it), so
-		 * every texture, buffer and shader is intact. */
-		{
-			static void* s_boundSurface = NULL;   /* what the context was last bound to */
-			static int   s_boundKnown   = 0;
-			SDL_SysWMinfo wm;
-			void*         cur = NULL;
-
-			SDL_VERSION(&wm.version);
-			if (SDL_GetWindowWMInfo(g_window, &wm))
-				cur = (void*)wm.info.android.surface;
-
-			if (!s_boundKnown)
-			{
-				s_boundSurface = cur;
-				s_boundKnown   = 1;
-			}
-
-			if (cur == NULL)
-			{
-				/* Between destroy and create: nothing to present to yet. */
-				return;
-			}
-
-			if (cur != s_boundSurface)
-			{
-				SDL_GLContext ctx = SDL_GL_GetCurrentContext();
-
-				SDL_GL_MakeCurrent(g_window, NULL);
-				if (ctx != NULL && SDL_GL_MakeCurrent(g_window, ctx) == 0)
-				{
-					eprintwarn("[SWAPDIAG] window surface replaced (%p -> %p); context rebound\n",
-						s_boundSurface, cur);
-					s_boundSurface = cur;
-					Swap_LogAndroidState("surface replaced");
-				}
-				else
-				{
-					eprintwarn("[SWAPDIAG] window surface replaced but rebind failed: %s\n",
-						SDL_GetError());
-					return;
-				}
-			}
-		}
-#endif
-
-		SDL_ClearError();
 		SDL_GL_SwapWindow(g_window);
-		{
-			const char* swapErr = SDL_GetError();
-			int         eglErr  = 0;
-			static int  s_swapBad = 0;
-			static int  s_rebindOk = 0;
-			static unsigned s_nextRecreateMs = 0;
-			static int      s_recreateTries  = 0;
-
-			/* SDL_GL_SwapWindow returns void and swallows the platform
-			 * result, so presentation can stop working in complete
-			 * silence -- which is what the cabinet looks like: the last
-			 * frame held while the game runs on and GL reports nothing.
-			 * eglGetError comes through dlsym; this file has no EGL
-			 * headers and does not need them for one symbol. */
-			{
-				typedef int (*EglErrFn)(void);
-				static EglErrFn s_eglGetError = NULL;
-				static int      s_eglTried    = 0;
-
-				if (!s_eglTried)
-				{
-					void* lib  = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
-
-					s_eglTried = 1;
-					if (lib != NULL)
-						s_eglGetError = (EglErrFn)dlsym(lib, "eglGetError");
-				}
-				if (s_eglGetError != NULL)
-				{
-					eglErr = s_eglGetError();
-					if (eglErr == 0x3000)   /* EGL_SUCCESS */
-						eglErr = 0;
-				}
-			}
-
-			if (eglErr != 0 || (swapErr != NULL && swapErr[0] != '\0'))
-			{
-				static unsigned s_nextSwapMs = 0;
-				static unsigned s_swapHits   = 0;
-				const unsigned  nowMs        = (unsigned)SDL_GetTicks();
-
-				s_swapHits++;
-				s_swapBad = 1;
-
-				/* First failure: say what state EGL is actually in. Whether the
-				 * handle SDL holds is still a live surface (eglQuerySurface works)
-				 * and whether it is the one bound to this thread
-				 * (eglGetCurrentSurface) are the two facts that separate "window
-				 * abandoned underneath us" from "surface replaced at the same
-				 * address". Then the logcat capture, which names the trigger. */
-				{
-					static int s_probed = 0;
-
-					if (!s_probed)
-					{
-						typedef void* (*EglGetCurSurfFn)(int);
-						typedef void* (*EglGetCurDispFn)(void);
-						typedef unsigned (*EglQuerySurfFn)(void*, void*, int, int*);
-						typedef int (*EglErrFn2)(void);
-						void*            lib   = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
-						EglGetCurSurfFn  getCur = lib ? (EglGetCurSurfFn)dlsym(lib, "eglGetCurrentSurface") : NULL;
-						EglGetCurDispFn  getDpy = lib ? (EglGetCurDispFn)dlsym(lib, "eglGetCurrentDisplay") : NULL;
-						EglQuerySurfFn   query  = lib ? (EglQuerySurfFn)dlsym(lib, "eglQuerySurface") : NULL;
-						EglErrFn2        getErr = lib ? (EglErrFn2)dlsym(lib, "eglGetError") : NULL;
-						SDL_SysWMinfo    wm;
-						void*            sdlSurf = NULL;
-						void*            curDraw = getCur ? getCur(0x3059 /* EGL_DRAW */) : NULL;
-						void*            dpy     = getDpy ? getDpy() : NULL;
-						int              w       = -1;
-						unsigned         qok     = 0;
-						int              qerr    = 0;
-
-						s_probed = 1;
-						SDL_VERSION(&wm.version);
-						if (SDL_GetWindowWMInfo(g_window, &wm))
-							sdlSurf = (void*)wm.info.android.surface;
-						if (query && dpy && sdlSurf)
-						{
-							qok  = query(dpy, sdlSurf, 0x3057 /* EGL_WIDTH */, &w);
-							qerr = getErr ? getErr() : 0;
-						}
-						eprintwarn("[SWAPDIAG] probe: sdlSurface=%p currentDraw=%p nativeWindow=%p"
-						           " querySurface(ok=%u width=%d err=0x%04X)\n",
-						           sdlSurf, curDraw, (void*)wm.info.android.window,
-						           qok, w, (unsigned)qerr);
-						Swap_LogAndroidState("first failed swap");
-						{
-							FILE* mf = fopen("/proc/meminfo", "r");
-							char  ml[160];
-
-							eprintwarn("[SWAPDIAG] t=%us; /proc/meminfo at the first failure:\n", (unsigned)(SDL_GetTicks() / 1000));
-							if (mf != NULL)
-							{
-								while (fgets(ml, sizeof(ml), mf) != NULL)
-									eprintwarn("[MEMINFO] %s", ml);
-								fclose(mf);
-							}
-						}
-					}
-				}
-
-				/* Recovery: a fresh window, three tries two seconds apart. The first
-				 * one works when the display pipeline is still alive. Once the
-				 * cabinet has parked it there is no vsync, so the view system cannot
-				 * even lay out a hidden-then-shown SurfaceView, and eight requests in
-				 * one log produced one real rebuild -- the rest only hid and showed
-				 * the view, which is the likeliest source of the reported green
-				 * border. So this stops, says why, and leaves it to the poke in
-				 * SilentHillActivity to keep the pipeline from parking at all. */
-				if (s_recreateTries < 3)
-				{
-					if (nowMs >= s_nextRecreateMs)
-					{
-						Swap_RequestSurfaceRecreate();
-						s_recreateTries++;
-						s_nextRecreateMs = nowMs + 2000u;
-					}
-				}
-				else if (s_recreateTries == 3)
-				{
-					s_recreateTries = 4;
-					eprintwarn("[SWAPDIAG] giving up on recreation: the display pipeline is parked by the system; "
-					           "only a display power transition can wake it\n");
-				}
-
-				/* Then try to recover, every failed frame: unbind so SDL cannot
-				 * short-circuit, rebind so the context attaches to whatever surface
-				 * SDL holds now -- including one recreated at the same address,
-				 * which the handle watch above cannot tell apart. Harmless when
-				 * the surface is genuinely dead; decisive when it is merely unbound. */
-				{
-					SDL_GLContext ctx = SDL_GL_GetCurrentContext();
-
-					SDL_GL_MakeCurrent(g_window, NULL);
-					s_rebindOk = (ctx != NULL && SDL_GL_MakeCurrent(g_window, ctx) == 0) ? 1 : 0;
-				}
-
-				/* Rebind the context to whatever surface SDL holds NOW.
-				 *
-				 * The cabinet loses its window surface after a few minutes and
-				 * every swap fails from then on, permanently: the compositor keeps
-				 * showing the last frame while the game runs on. Keeping the screen
-				 * awake did not stop it, and that machine never sleeps anyway, so
-				 * rather than keep hunting the trigger the renderer should survive
-				 * it. If SDL has already built a replacement surface, making the
-				 * context current again binds to it and the next swap works. */
-
-
-				if (nowMs >= s_nextSwapMs)
-				{
-					eprintwarn("[SWAPDIAG] swap: egl=0x%04X sdl='%s' x%u (rebind %s)\n",
-						(unsigned)eglErr, (swapErr != NULL) ? swapErr : "", s_swapHits,
-						s_rebindOk ? "ok" : "failed");
-					s_swapHits   = 0;
-					s_nextSwapMs = nowMs + 3000u;
-					Swap_LogAndroidState("still failing");
-				}
-			}
-			else if (s_swapBad)
-			{
-				s_swapBad = 0;
-				s_nextRecreateMs = 0;
-				s_recreateTries  = 0;
-				eprintwarn("[SWAPDIAG] presentation recovered\n");
-				Swap_LogAndroidState("recovered");
-			}
-		}
 	}
 #endif
 

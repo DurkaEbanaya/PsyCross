@@ -336,8 +336,8 @@ void GR_ApplyRenderScale(void)
 		g_windowWidth  = w;
 		g_windowHeight = h;
 	}
-}
-
+}
+
 /* C-callable, for the options menu: the game side is C and cannot link the
  * mangled name. Goes through the same clamp and rebuild as startup. */
 extern "C" void PsyX_RenderScaleApply(void)
@@ -945,8 +945,8 @@ void PBO_Download(GrPBO* pbo)
 
 GLuint		g_glVertexArray[2];
 GLuint		g_glVertexBuffer[2];
-int			g_curVertexBuffer = 0;
-
+int			g_curVertexBuffer = 0;
+
 /* Where the next flush writes in each of the two frame VBOs, and the vertex
  * that offset lands on: every draw indexing the frame buffer is shifted by it.
  * See GR_UpdateVertexBuffer for why the buffer is used as a ring. */
@@ -955,7 +955,14 @@ extern "C" { int g_vboBaseVertex = 0; }
 static void GR_SetupVertexAttribs();
 static void GR_DetectVaoRespec();
 
-/* Some drivers want the attribute pointers re-specified on every bind.
+/* WITHDRAWN: the Midgard carve-out that used to live here.
+ *
+ * It was based on a cabinet run that looked like a 51 -> 14.7 fps collapse
+ * from setting the vertex layout once. That run was at render_scale 0.700
+ * against 0.350 in the runs it was compared with -- four times the pixels on a
+ * Mali-T720 -- which accounts for the whole difference on its own. The VAO
+ * change was never shown to cost anything there, so every device keeps the
+ * fast path until a measurement with the scale held fixed says otherwise.
  *
  * Setting them once in the VAO is correct and is what every modern driver
  * wants -- on a phone it took the frame from 47.9 ms to 12.7 ms. On ARM's
@@ -1009,6 +1016,20 @@ int g_presentWidth = 0, g_presentHeight = 0;
  * a deliberately low resolution. */
 int g_PcPresentScale = 2;
 
+/* Native (PSX) resolution: the scene target follows the display mode the game
+ * sets each frame -- 320x224 in play, 640x448 for the Konami screens, 320x448
+ * menus -- and is scaled onto the window at present, always as a 4:3 picture
+ * the way a television showed every one of those modes. Set before
+ * GR_InitialiseRender. The PC overlays draw after that scale, at window
+ * resolution: at 320x224 their text would be a few pixels tall. */
+extern "C" void (*g_PsyX_PostCaptureHook)(void);
+int g_PcNativeRender = 0;
+
+/* The split being drawn addresses text glyphs (PsyX_GPU.cpp sets it before
+ * each bind); GR_SetTextureShader keeps those point-sampled. */
+int g_PsxSplitIsGlyph = 0;
+static int s_overlayToWindow = 0;
+
 /* Sharp bilinear needs somewhere to put the nearest whole-multiple upscale
  * before the smooth pass. That intermediate is what keeps texel edges crisp
  * while still easing the leftover fraction. */
@@ -1036,6 +1057,8 @@ extern "C" GLuint GR_ScreenFBO(void)
 	 * driver picks, so binding 0 there selects a framebuffer that does not
 	 * exist and every draw is silently discarded. Compile-time 0 elsewhere, so
 	 * the internal-target path is unchanged for every other target. */
+	if (s_overlayToWindow)
+		return (GLuint)PSYX_DEFAULT_FBO;
 	return g_internalFBO ? g_internalFBO : (GLuint)PSYX_DEFAULT_FBO;
 }
 
@@ -1094,9 +1117,27 @@ extern "C" GLuint GR_ScreenReadFBO(void)
 static void GR_PresentRect(int* outX, int* outY, int* outW, int* outH)
 {
 	int x = 0, y = 0, w = g_presentWidth, h = g_presentHeight;
+
+	/* Every PSX mode is a 4:3 picture, whatever its pixel count. */
+	if (g_PcNativeRender && w > 0 && h > 0)
+	{
+		if (w * 3 > h * 4)
+		{
+			w = (h * 4 + 1) / 3;
+			x = (g_presentWidth - w) / 2;
+		}
+		else
+		{
+			h = (w * 3 + 2) / 4;
+			y = (g_presentHeight - h) / 2;
+		}
+		*outX = x; *outY = y; *outW = w; *outH = h;
+		return;
+	}
 	const bool wantPillarbox =
-		(g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
-		(!g_PcHorPlusEnabled && g_PcMenuPillarbox);
+		!g_PcNativeRender &&
+		((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
+		 (!g_PcHorPlusEnabled && g_PcMenuPillarbox));
 
 	if (wantPillarbox && s_internalW > 0 && s_internalH > 0 && h > 0)
 	{
@@ -1154,6 +1195,30 @@ static void GR_PresentBlit(GLuint src, int dx, int dy, int dw, int dh)
 
 		if (ny < n) n = ny;
 		if (n < 1)  n = 1; /* window smaller than the render: just fit it */
+
+		if (mode == 0 && g_PcNativeRender)
+		{
+			/* A PSX mode's pixels are not square (320x224 fills a 4:3 screen),
+			 * so whole multiples go on the LINES, as a television's scan does,
+			 * and the width follows 4:3. Shimmer-free vertically, which is where
+			 * the eye catches it. */
+			int       k  = dh / s_internalH;
+			const int iw0 = (s_internalH * 4) / 3;
+
+			if (k < 1) k = 1;
+			while (k > 1 && iw0 * k > dw)
+				k--;
+			{
+				const int ih = s_internalH * k;
+				const int iw = (ih * 4) / 3;
+				const int ix = dx + (dw - iw) / 2;
+				const int iy = dy + (dh - ih) / 2;
+
+				glBlitFramebuffer(0, 0, s_internalW, s_internalH, ix, iy, ix + iw, iy + ih,
+				                  GL_COLOR_BUFFER_BIT, GL_NEAREST);
+			}
+			return;
+		}
 
 		if (mode == 0)
 		{
@@ -1852,6 +1917,25 @@ extern "C" void GR_ApplyPresentSize(int realW, int realH)
 	g_presentWidth  = realW;
 	g_presentHeight = realH;
 
+	/* Native: the target keeps whatever mode the game is in (GR_NativeTrack);
+	 * a window resize only moves where it lands. 320x240 until the first
+	 * PutDispEnv says otherwise. */
+	if (g_PcNativeRender)
+	{
+		const int w = (s_internalW > 0) ? s_internalW : 320;
+		const int h = (s_internalH > 0) ? s_internalH : 240;
+
+		if (GR_SetInternalResolution(w, h))
+		{
+			g_windowWidth  = w;
+			g_windowHeight = h;
+			return;
+		}
+		eprintwarn("Native resolution unavailable: the internal target could not be created; "
+		           "rendering at the window size instead.\n");
+		g_PcNativeRender = 0;
+	}
+
 	/* Never on iOS. The internal target exists so borderless can render at a
 	 * chosen resolution and stretch to the desktop; a phone has no window mode
 	 * and no resolution to choose, and g_windowWidth/Height there are the
@@ -1906,9 +1990,11 @@ int GR_InitialiseRender(char* windowName, int width, int height, int fullscreen)
 
 		s_suppressWindowMsaa = 0;
 
-		if (fullscreen == 2 && width > 0 && height > 0 && g_cfg_msaaSamples > 0 &&
-		    SDL_GetDesktopDisplayMode(0, &dm) == 0 &&
-		    (width != dm.w || height != dm.h))
+		if (g_cfg_msaaSamples > 0 &&
+		    (g_PcNativeRender ||
+		     (fullscreen == 2 && width > 0 && height > 0 &&
+		      SDL_GetDesktopDisplayMode(0, &dm) == 0 &&
+		      (width != dm.w || height != dm.h))))
 		{
 			/* The WINDOW must stay single-sample either way: the present is a
 			 * blit into the default framebuffer, and a single-sample source into
@@ -2045,9 +2131,33 @@ void GR_UpdateSwapIntervalState(int swapInterval)
 #endif
 }
 
+/* Follow the display mode the game set. Done at the top of a frame, so a frame
+ * is never split across two targets; the one frame drawn after a switch is
+ * still mapped correctly (DrawEnvDimensions reads the live mode), just at the
+ * previous size. Sizes outside anything the PSX can display are ignored. */
+static void GR_NativeTrack(void)
+{
+	const int w = activeDispEnv.disp.w;
+	const int h = activeDispEnv.disp.h;
+
+	if (!g_PcNativeRender || g_internalFBO == 0)
+		return;
+	if (w < 256 || w > 640 || h < 192 || h > 512)
+		return;
+	if (w == s_internalW && h == s_internalH)
+		return;
+
+	if (GR_SetInternalResolution(w, h))
+	{
+		g_windowWidth  = w;
+		g_windowHeight = h;
+	}
+}
+
 void GR_BeginScene()
 {
 	g_lastBoundTexture = 0;
+	GR_NativeTrack();
 
 #if USE_OPENGL
 #ifdef RENDERER_OGLES
@@ -3558,8 +3668,6 @@ int GR_InitialisePSX()
 
 			/* Once per VAO, not once per flush -- except on the drivers
 			 * GR_DetectVaoRespec names. See GR_SetupVertexAttribs. */
-			if (i == 0)
-				GR_DetectVaoRespec();
 			GR_SetupVertexAttribs();
 		}
 
@@ -4067,24 +4175,41 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 *
 	 * The hi-res override sampler decodes nothing: it reads s_texture through GL
 	 * sampler state, which upload_rgba fixes at LINEAR(+mips) for any replacement
-	 * larger than native and never revisits — so neither toggle could reach it and
-	 * HD menu/map art stayed bilinear with menu_filter off. It gets 1 on 3D frames
-	 * unconditionally so world texture packs keep sampling exactly as before,
-	 * while its 2D prims follow the same v_is3d gate the VRAM path uses. */
-	/* menu_filter smooths HD menu/map art, so it only applies to art that is
-	 * actually hi-res. Forcing it on PALETTISED (4/8-bit) textures smeared the
-	 * PSX-native art it was never meant to touch — including the kanji atlas,
-	 * whose 12px cells are packed edge to edge in the framebuffer margins, so a
-	 * bilinear tap at a cell boundary pulls in the NEXT glyph's first column and
-	 * draws it as a full-height vertical bar between characters. That is the
-	 * stray-lines report from the Chinese text, and it would hit Japanese the
-	 * same way. Native paletted art now stays nearest on menu frames, which is
-	 * also what it looks like on hardware. */
+	 * larger than native and never revisits -- so neither toggle can reach it from
+	 * the bind side, and the snap has to happen in the shader. It takes the same
+	 * gate value as the VRAM samplers, so one setting now covers both classes. */
+	/* menu_filter used to be restricted to TF_32_BIT_RGBA, i.e. to hi-res
+	 * replacements only. Native paletted art is nearly all of the UI, so on a
+	 * stock install the setting did nothing whatsoever -- which is the "UI
+	 * option is broken completely, everything stays pixellated" report.
+	 *
+	 * The restriction was a workaround for glyph bleed: the kanji atlas packs
+	 * 12px cells edge to edge, so a bilinear tap at a cell boundary pulled in
+	 * the next glyph's first column and drew it as a vertical bar. Five days
+	 * later the UV-limits clamp landed (TapWeighted above), which pins every tap
+	 * inside the primitive's own vertex-UV box -- and a glyph IS its own rect
+	 * prim with its own box, so a tap cannot reach the neighbouring cell any
+	 * more. At the box edge both taps read the edge texel, which is the
+	 * PSX-faithful colour. The workaround has been redundant since then, and
+	 * only the breakage was left.
+	 *
+	 * texture_filter now also governs hi-res art on 3D frames instead of being
+	 * ignored for it. It was pinned to 1 there so texture packs "kept sampling
+	 * exactly as before", but that is precisely the complaint that the mode has
+	 * no effect: with Filtering off, pack art stayed smooth while native art
+	 * changed, so the two classes disagreed about what the setting meant. Off
+	 * means off everywhere now. A native-resolution replacement comes out the
+	 * same either way (see the hi-res sampler's u_hiresHalf note). */
+	/* Splits the host names as unfilterable glyphs (g_PsyX_TextGlyphTest: the
+	 * kanji atlas) stay point-sampled under either filter. The UV-limits clamp
+	 * stopped the neighbouring cell bleeding in, but dense one-pixel strokes
+	 * magnified four or five times and bilinear-smoothed run into blots -- the
+	 * blurred Japanese and Chinese menus. Everything else keeps the filter. */
 	if (u_bilinearFilterLoc != -1)
 		glUniform1i(u_bilinearFilterLoc,
-		            g_PsxDitherSuppressed
-		                ? ((g_cfg_menuFilter && texFormat == TF_32_BIT_RGBA) ? 2 : 0)
-		                : ((texFormat == TF_32_BIT_RGBA || g_cfg_textureFilter > 0) ? 1 : 0));
+		            g_PsxSplitIsGlyph       ? 0
+		            : g_PsxDitherSuppressed ? (g_cfg_menuFilter ? 2 : 0)
+		                                    : ((g_cfg_textureFilter > 0) ? 1 : 0));
 
 	/* How to filter, once the gate above says whether to. Anisotropic is walked
 	 * by hand for CLUT textures (see AnisoTextureSample); 1.0 means plain
@@ -4367,8 +4492,9 @@ void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsi
 	 * then clear only the 4:3 region to the requested color via a scissor.
 	 * Skipped when the clear is already black (menus) — those bars are fine. */
 	const bool wantPillarbox =
-		(g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
-		(!g_PcHorPlusEnabled && g_PcMenuPillarbox);
+		!g_PcNativeRender &&
+		((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
+		 (!g_PcHorPlusEnabled && g_PcMenuPillarbox));
 	/* Menus are NOT excluded any more. They used to be, on the grounds that a
 	 * black clear leaves black bars anyway -- but the fall-through path at the
 	 * bottom runs with the PSX clip-rect SCISSOR still enabled, so its clear is
@@ -4611,9 +4737,20 @@ void GR_SetScissorState(int enable)
 extern "C" void PsyX_GetDisplayViewport(int* outX, int* outY, int* outW, int* outH)
 {
 	int vpX = 0, vpY = 0, vpW = g_windowWidth, vpH = g_windowHeight;
+
+	if (s_overlayToWindow)
+	{
+		GR_PresentRect(&vpX, &vpY, &vpW, &vpH);
+		if (outX) *outX = vpX;
+		if (outY) *outY = vpY;
+		if (outW) *outW = vpW;
+		if (outH) *outH = vpH;
+		return;
+	}
 	const bool wantPillarbox =
-		(g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
-		(!g_PcHorPlusEnabled && g_PcMenuPillarbox);
+		!g_PcNativeRender &&
+		((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
+		 (!g_PcHorPlusEnabled && g_PcMenuPillarbox));
 	if (wantPillarbox && g_windowHeight > 0) {
 		const float psxAspect = 4.0f / 3.0f;
 		const float winAspect = (float)g_windowWidth / (float)g_windowHeight;
@@ -4642,8 +4779,9 @@ extern "C" int PsyX_MapWindowToViewport(int mx, int my, float* outFracX, float* 
 		my = (int)((float)my * (float)g_windowHeight / (float)g_surfaceHeight + 0.5f);
 	}
 	const bool wantPillarbox =
-		(g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
-		(!g_PcHorPlusEnabled && g_PcMenuPillarbox);
+		!g_PcNativeRender &&
+		((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
+		 (!g_PcHorPlusEnabled && g_PcMenuPillarbox));
 	if (wantPillarbox && g_windowHeight > 0) {
 		const float psxAspect = 4.0f / 3.0f;
 		const float winAspect = (float)g_windowWidth / (float)g_windowHeight;
@@ -4950,8 +5088,9 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 		{
 			int vpX = 0, vpY = 0, vpW = g_windowWidth, vpH = g_windowHeight;
 			const bool wantPillarbox =
-				(g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
-				(!g_PcHorPlusEnabled && g_PcMenuPillarbox);
+				!g_PcNativeRender &&
+				((g_PcHorPlusEnabled && g_PcWidescreenMode == 0) ||
+				 (!g_PcHorPlusEnabled && g_PcMenuPillarbox));
 			if (wantPillarbox && g_windowHeight > 0) {
 				const float psxAspect = 4.0f / 3.0f;
 				const float winAspect = (float)g_windowWidth / (float)g_windowHeight;
@@ -5177,6 +5316,30 @@ static GLint    g_postLoc_calib = -1;
 /* Set nonzero by the Brightness screen so GR_PostProcess overlays the reference
  * bar; cleared when it exits. */
 extern "C" { int g_cfg_calibBar = 0; }
+
+/* Image-adjustment scope (config key image_adjust_scope).
+ *
+ * Brightness/contrast/saturation are a grade of the COMPOSED frame, so they
+ * used to hit the menus, the paper map, the save screen and every FMV as well
+ * as the world -- the complaint in issue #150. With world-only scope the grade
+ * is skipped on frames that render no 3D world, which on this game means the
+ * UI and movie screens, since there is no persistent in-game HUD to worry
+ * about.
+ *
+ * The look filters (CRT, scanlines, vignette, grain, sharpen) and the tonemap
+ * are deliberately NOT scoped: those emulate a display or a film response and
+ * belong over the whole frame.
+ *
+ * g_cfg_sceneFrame is published once per frame by the game side
+ * (DbgOverlay_Render). g_cfg_calibBar forces the grade back on for the
+ * Brightness screen itself -- it IS a UI screen, and without this exception
+ * its own calibration preview would stop responding to the sliders. */
+extern "C" { int g_cfg_imageAdjustScope = 1; int g_cfg_sceneFrame = 1; }
+
+extern "C" int GR_ImageAdjustActive(void)
+{
+	return g_cfg_imageAdjustScope == 0 || g_cfg_sceneFrame || g_cfg_calibBar;
+}
 static GLuint   g_postVAO = 0;
 static GLuint   g_postFBO = 0;
 static TextureID g_postTex = (TextureID)-1;
@@ -5402,12 +5565,21 @@ static void GR_DrawFullscreenTexture(TextureID tex, int mode)
 		glUniform1f(g_postLoc_postInt, g_cfg_postProcessIntensity);
 	if (g_postLoc_tmInt != -1)
 		glUniform1f(g_postLoc_tmInt, g_cfg_tonemapIntensity);
-	if (g_postLoc_bright != -1)
-		glUniform1f(g_postLoc_bright, g_cfg_brightness);
-	if (g_postLoc_contrast != -1)
-		glUniform1f(g_postLoc_contrast, g_cfg_contrast);
-	if (g_postLoc_satur != -1)
-		glUniform1f(g_postLoc_satur, g_cfg_saturation);
+	/* Out of scope = pass neutral rather than skip the pass, since a look filter
+	 * or the tonemap may still need it this frame. */
+	{
+		const int   adj = GR_ImageAdjustActive();
+		const float br  = adj ? g_cfg_brightness : 1.0f;
+		const float ct  = adj ? g_cfg_contrast   : 1.0f;
+		const float sa  = adj ? g_cfg_saturation : 1.0f;
+
+		if (g_postLoc_bright != -1)
+			glUniform1f(g_postLoc_bright, br);
+		if (g_postLoc_contrast != -1)
+			glUniform1f(g_postLoc_contrast, ct);
+		if (g_postLoc_satur != -1)
+			glUniform1f(g_postLoc_satur, sa);
+	}
 	if (g_postLoc_calib != -1)
 		glUniform1i(g_postLoc_calib, g_cfg_calibBar);
 
@@ -5440,8 +5612,9 @@ void GR_PostProcess(void)
 {
 	/* Also run when an image adjustment is off-neutral or the calibration bar is
 	 * requested, so brightness/contrast/saturation apply with no filter selected. */
-	const int bcsActive = (g_cfg_brightness != 1.0f) || (g_cfg_contrast != 1.0f) ||
-	                      (g_cfg_saturation != 1.0f) || (g_cfg_calibBar != 0);
+	const int bcsActive = GR_ImageAdjustActive() &&
+	                      ((g_cfg_brightness != 1.0f) || (g_cfg_contrast != 1.0f) ||
+	                       (g_cfg_saturation != 1.0f) || (g_cfg_calibBar != 0));
 	if (g_cfg_postProcess <= 0 && g_cfg_tonemap <= 0 && !bcsActive)
 		return;
 	if (g_postShader == (ShaderID)-1)
@@ -7085,9 +7258,19 @@ void GR_DumpVRAM(const char* path)
  * thing that broke instead of a wall of repeats. */
 void GR_DiagGLError(const char* where)
 {
+	/* Rate-limited per site, NOT once-per-site-forever as it used to be.
+	 *
+	 * The old dedupe made "one [GLDIAG] line in the log" look like one error,
+	 * when the cabinet's GL_OUT_OF_MEMORY may be happening on every frame from
+	 * then on -- which is what a frozen picture with the game still running
+	 * actually looks like. A count tells those two apart. */
 	static const char* s_seen[16];
+	static unsigned    s_hits[16];
+	static unsigned    s_nextMs[16];
 	static int         s_seenCount = 0;
 	GLenum             err;
+	int                i, slot = -1;
+	unsigned           now;
 
 	if (!g_grIsGLES && !g_dbg_glDiag)
 		return;
@@ -7096,16 +7279,33 @@ void GR_DiagGLError(const char* where)
 	if (err == GL_NO_ERROR)
 		return;
 
-	for (int i = 0; i < s_seenCount; i++)
+	for (i = 0; i < s_seenCount; i++)
 	{
 		if (s_seen[i] == where)
-			return;
+		{
+			slot = i;
+			break;
+		}
 	}
-	if (s_seenCount < 16)
-		s_seen[s_seenCount++] = where;
+	if (slot < 0)
+	{
+		if (s_seenCount >= 16)
+			return;
+		slot          = s_seenCount++;
+		s_seen[slot]  = where;
+		s_hits[slot]  = 0;
+		s_nextMs[slot] = 0;
+	}
 
-	eprintwarn("[GLDIAG] GL error 0x%04X at %s (backend=%s)\n",
-		(unsigned)err, where, PsyX_Backend_GetName(g_grActiveBackend));
+	s_hits[slot]++;
+	now = (unsigned)SDL_GetTicks();
+	if (now < s_nextMs[slot])
+		return;
+
+	eprintwarn("[GLDIAG] GL error 0x%04X at %s x%u (backend=%s)\n",
+		(unsigned)err, where, s_hits[slot], PsyX_Backend_GetName(g_grActiveBackend));
+	s_hits[slot]   = 0;
+	s_nextMs[slot] = now + 3000u;
 }
 
 /* [GREYFRAME] per-swap half, run on the window framebuffer right before the
@@ -7272,6 +7472,19 @@ void GR_SwapWindow()
 		}
 
 		GR_PresentBlit(src, dx, dy, dw, dh);
+
+		/* Native: the PC overlays draw now, onto the window over the scaled
+		 * picture, in the same 4:3 rect -- so their pointer fractions still
+		 * line up (PsyX_MapWindowToViewport works in fractions of it). */
+		if (g_PcNativeRender && g_PsyX_PostCaptureHook)
+		{
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glViewport(dx, dy, dw, dh);
+			s_overlayToWindow = 1;
+			g_PsyX_PostCaptureHook();
+			s_overlayToWindow = 0;
+			glViewport(0, 0, g_presentWidth, g_presentHeight);
+		}
 		if (g_PsxVoidProbeArmed)
 		{
 			VoidProbeRows("window", 0, g_presentWidth, g_presentHeight);
@@ -7320,7 +7533,24 @@ void GR_SwapWindow()
 	{
 		GreyFrame_Present(g_internalFBO ? g_presentWidth : g_windowWidth,
 		                  g_internalFBO ? g_presentHeight : g_windowHeight);
+		{
+			/* Android owns the surface while the app is in the background, and
+			 * SDL has made the context non-current on this thread; presenting
+			 * then fails or breaks the surface. */
+			extern int g_PsyX_AppPaused;
+
+			if (g_PsyX_AppPaused)
+				return;
+		}
+
+		/* Swap with the window framebuffer bound. macOS 26's GL-on-Metal
+		 * presents nothing (a black window) when an FBO is still bound at
+		 * flushBuffer, even though the window framebuffer holds the finished
+		 * frame. PSYX_DEFAULT_FBO, not 0: on iOS 0 is not the screen. */
+		glBindFramebuffer(GL_FRAMEBUFFER, PSYX_DEFAULT_FBO);
 		SDL_GL_SwapWindow(g_window);
+		if (g_internalFBO)
+			glBindFramebuffer(GL_FRAMEBUFFER, g_internalFBO);
 	}
 #endif
 
@@ -7582,25 +7812,25 @@ void GR_SetWireframe(int enable)
 static void GR_SetupVertexAttribs()
 {
 #if USE_OPENGL
-	glEnableVertexAttribArray(a_position);
-	glEnableVertexAttribArray(a_texcoord);
-	glEnableVertexAttribArray(a_color);
-	glEnableVertexAttribArray(a_extra);
-	glVertexAttribPointer(a_position, 4, GL_SHORT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->x);
-	glVertexAttribPointer(a_zw, 1, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->z);
-	glEnableVertexAttribArray(a_zw);
-	glVertexAttribPointer(a_pgxp, 3, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->ppx);
-	glEnableVertexAttribArray(a_pgxp);
-	glVertexAttribPointer(a_texcoord, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->u);
-	glVertexAttribPointer(a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GrVertex), &((GrVertex*)NULL)->r);
-	glVertexAttribPointer(a_extra, 4, GL_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->tcx);
-	glVertexAttribPointer(a_normal, 3, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->nx);
-	glEnableVertexAttribArray(a_normal);
-	glVertexAttribPointer(a_viewpos, 3, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->vsx);
-	glEnableVertexAttribArray(a_viewpos);
-	glVertexAttribPointer(a_geom3d, 1, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->geom3d);
-	glEnableVertexAttribArray(a_geom3d);
-	glVertexAttribPointer(a_uvlim, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->ulo);
+	glEnableVertexAttribArray(a_position);
+	glEnableVertexAttribArray(a_texcoord);
+	glEnableVertexAttribArray(a_color);
+	glEnableVertexAttribArray(a_extra);
+	glVertexAttribPointer(a_position, 4, GL_SHORT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->x);
+	glVertexAttribPointer(a_zw, 1, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->z);
+	glEnableVertexAttribArray(a_zw);
+	glVertexAttribPointer(a_pgxp, 3, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->ppx);
+	glEnableVertexAttribArray(a_pgxp);
+	glVertexAttribPointer(a_texcoord, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->u);
+	glVertexAttribPointer(a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GrVertex), &((GrVertex*)NULL)->r);
+	glVertexAttribPointer(a_extra, 4, GL_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->tcx);
+	glVertexAttribPointer(a_normal, 3, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->nx);
+	glEnableVertexAttribArray(a_normal);
+	glVertexAttribPointer(a_viewpos, 3, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->vsx);
+	glEnableVertexAttribArray(a_viewpos);
+	glVertexAttribPointer(a_geom3d, 1, GL_FLOAT, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->geom3d);
+	glEnableVertexAttribArray(a_geom3d);
+	glVertexAttribPointer(a_uvlim, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(GrVertex), &((GrVertex*)NULL)->ulo);
 	glEnableVertexAttribArray(a_uvlim);
 #endif
 }
@@ -7612,9 +7842,6 @@ void GR_BindVertexBuffer()
 	/* Still bound explicitly: the VAO remembers the attribute bindings, but
 	 * GL_ARRAY_BUFFER is global state and the upload below writes through it. */
 	glBindBuffer(GL_ARRAY_BUFFER, g_glVertexBuffer[g_curVertexBuffer]);
-
-	if (s_vaoRespecPerBind)
-		GR_SetupVertexAttribs();
 
 	g_curVertexBuffer++;
 	g_curVertexBuffer &= 1;
@@ -7744,12 +7971,42 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 			return;
 		}
 
+		/* Wrap by resetting the cursor. NOTHING is reallocated here, and
+		 * nothing is mapped: after init this function performs exactly one GL
+		 * call, a copy into storage that already exists.
+		 *
+		 * The 962 MB Mali cabinet dies with GL_OUT_OF_MEMORY after a few
+		 * minutes of standing still, with vram_uploads=0 and no textures being
+		 * created -- so something allocated per frame and was not given back.
+		 * Every build that crashed churned buffer allocations: first an orphan
+		 * per flush, then an orphan per wrap plus an UNSYNCHRONIZED map per
+		 * flush, which Midgard is known to service by ghosting the store.
+		 * Shrinking the buffer made it worse rather than better, because a
+		 * smaller ring wraps four times as often -- which is itself the
+		 * evidence that the wrap, not the size, was the cost.
+		 *
+		 * Safe without the orphan because the ring holds many frames of
+		 * vertices (see MAX_VERTEX_BUFFER_SIZE) while the GPU is at most a
+		 * frame or two behind, so by the time the cursor comes back around to
+		 * a region, nothing is still reading it. */
 		if (offset + needed > capped)
-		{
-			glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)capped, NULL, GL_STREAM_DRAW);
 			offset = 0;
-		}
 
+		/* Mapped UNSYNCHRONIZED in preference to glBufferSubData, because the
+		 * cabinet's one GL_OUT_OF_MEMORY lands exactly here.
+		 *
+		 * A plain sub-data write into a buffer the GPU may still be reading is
+		 * the classic trigger for Midgard to "ghost" it -- quietly duplicate
+		 * the whole store so the old contents stay valid for work in flight.
+		 * That is a multi-megabyte allocation behind a call that looks like a
+		 * memcpy, and on a 962 MB box it eventually cannot be served. An
+		 * unsynchronized map is the promise that makes ghosting unnecessary:
+		 * nothing being written is a region anything is still reading, which is
+		 * true of a ring that only ever moves forward.
+		 *
+		 * This is the one combination never tried: no orphan AND no ghost.
+		 * Earlier builds had the map but still orphaned on wrap, or dropped the
+		 * orphan but wrote with sub-data. Sub-data stays as the fallback. */
 		void* dst = glMapBufferRange ?
 			glMapBufferRange(GL_ARRAY_BUFFER, (GLintptr)offset, (GLsizeiptr)needed,
 			                 GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT |
@@ -7764,6 +8021,7 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 		{
 			glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)offset, (GLsizeiptr)needed, vertices);
 		}
+		GR_DiagGLError("vertex upload");
 
 		/* Every draw that indexes THIS buffer has to be shifted by where the
 		 * flush landed; the two sites that do are DrawSplit and the shadow
@@ -7785,6 +8043,10 @@ void GR_DrawTriangles(int start_vertex, int triangles)
 		GreyFrame_FirstDraw();
 	s_gf.tris += triangles;
 	glDrawArrays(GL_TRIANGLES, start_vertex, triangles * 3);
+	/* Per draw, so the failing operation is named rather than inferred from a
+	 * sweep at the end of the scene. Costs a glGetError per draw in a build
+	 * that is already writing a log. */
+	GR_DiagGLError("glDrawArrays");
 #else
 #error
 #endif

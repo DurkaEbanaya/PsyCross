@@ -721,6 +721,15 @@ static int s_curPrimIsFeedback = 0;
 /* The primitive samples the live scene-scratch rect: a soft-focus composite
  * strip (see GR_SceneFbRedirectCovers). Cleared per primitive. */
 static int s_curPrimIsScratch = 0;
+
+/* Host-supplied: does this tpage/CLUT pair address glyphs that must not be
+ * filtered (in this port, the kanji atlas: dense one-pixel strokes that a
+ * bilinear tap at four or five times their size runs together into blots)?
+ * Such a split is always point-sampled. NULL = none. */
+extern "C" int (*g_PsyX_TextGlyphTest)(int tpage, int clut);
+int (*g_PsyX_TextGlyphTest)(int tpage, int clut) = NULL;
+static int s_curPrimIsGlyph = 0;
+extern int g_PsxSplitIsGlyph;
 extern "C" int GR_SceneFbRedirectCovers(int x, int y);
 extern "C" float g_PsxFeedbackDampBlend;
 
@@ -731,6 +740,8 @@ static int s_curPrimR0 = 128;
 static inline void ApplyHiresOverride(int tpage, int clut)
 {
 	int nW = 0, nH = 0, offX = 0, offY = 0, hiW = 0, hiH = 0;
+
+	s_curPrimIsGlyph = (g_PsyX_TextGlyphTest != NULL) ? g_PsyX_TextGlyphTest(tpage, clut) : 0;
 
 	/* Framebuffer-feedback consumers announce themselves here: 16bpp (tp >= 2)
 	 * addressing the left 320 VRAM columns is the display-buffer band, which is
@@ -1732,6 +1743,8 @@ struct GPUDrawSplit
 	int				overrideHiresW;
 	int				overrideHiresH;
 
+	int				isGlyph; /* see g_PsyX_TextGlyphTest */
+
 	const char*		debugText;
 };
 
@@ -2298,6 +2311,11 @@ void MakeTexcoordRect(GrVertex* vertex, unsigned char* uv, short page, short clu
 	 * offset instead (a_extra.xy * 0.5 in the vertex shader, so 2 = +1 texel).
 	 * Genuine overflows past 256 keep the old clamp. */
 	int extendU = 0, extendV = 0;
+	/* The sprite's own texels end one BEFORE u+w / v+h -- the far edge is
+	 * exclusive and the hardware never reads it. Only meaningful when the
+	 * size went through untouched. */
+	const int lastU = (int(uv[0]) + w <= 255 && w > 0) ? int(uv[0]) + w - 1 : -1;
+	const int lastV = (int(uv[1]) + h <= 255 && h > 0) ? int(uv[1]) + h - 1 : -1;
 
 	if (int(uv[0]) + w == 256)     { w = 255 - uv[0]; extendU = 1; }
 	else if (int(uv[0]) + w > 255) { w = 255 - uv[0]; }
@@ -2369,6 +2387,17 @@ void MakeTexcoordRect(GrVertex* vertex, unsigned char* uv, short page, short clu
 	 * around P - 0.5 itself, so nothing needs compensating here. */
 
 	SetUvLimits(vertex, 4);
+
+	/* The filter's taps are clamped to this box, and a box ending at u+w / v+h
+	 * let them read the texel past the sprite: whatever VRAM held beside it,
+	 * drawn as a coloured line down the edge of the loading-screen picture
+	 * (and anything else built from abutting sprites). End it at the last
+	 * texel the sprite really shows. */
+	for (int i = 0; i < 4; i++)
+	{
+		if (lastU >= 0) vertex[i].uhi = (unsigned char)lastU;
+		if (lastV >= 0) vertex[i].vhi = (unsigned char)lastV;
+	}
 }
 
 void MakeTexcoordLineZero(GrVertex* vertex, unsigned char dither)
@@ -2902,6 +2931,7 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 		curSplit.drawenv.clip.w == activeDrawEnv.clip.w &&
 		curSplit.drawenv.clip.h == activeDrawEnv.clip.h &&
 		curSplit.drawenv.dfe == activeDrawEnv.dfe &&
+		curSplit.isGlyph == (textured ? s_curPrimIsGlyph : 0) &&
 		curSplit.debugText == currentSplitDebugText)
 	{
 		return;
@@ -2935,6 +2965,7 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 	split.drawenv = activeDrawEnv;
 	split.dispenv = activeDispEnv;
 	split.debugText = currentSplitDebugText;
+	split.isGlyph   = textured ? s_curPrimIsGlyph : 0;
 
 	split.drawenv.tw.w = overrideTextureWidth;
 	split.drawenv.tw.h = overrideTextureHeight;
@@ -3037,6 +3068,7 @@ void DrawSplit(const GPUDrawSplit& split)
 
 	GR_SetStencilMode(split.drawPrimMode);	// draw with mask 0x16
 
+	g_PsxSplitIsGlyph = split.isGlyph;
 	GR_SetTexture(split.textureId, split.texFormat);
 
 	if (split.texFormat == TF_32_BIT_RGBA)
@@ -4315,6 +4347,7 @@ int ParsePrimitive(P_TAG* polyTag)
 	s_curPrimSemiTrans  = (polyTag->code & 2) ? 1 : 0;
 	s_curPrimIsFeedback = 0;
 	s_curPrimIsScratch  = 0;
+	s_curPrimIsGlyph    = 0;
 	s_curPrimR0         = polyTag->pad0; /* r0 in every prim struct */
 
 	switch (primType)

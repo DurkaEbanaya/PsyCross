@@ -804,6 +804,22 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 	SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "0");
 #endif
 	
+	/* Keep the display awake while the game runs.
+	 *
+	 * Standing still for a few minutes let the arcade cabinet blank its
+	 * screen, and Android destroys the window surface when it does. The game
+	 * carried on rendering into a surface that no longer existed:
+	 * eglSwapBuffers returned EGL_BAD_SURFACE on EVERY frame from then on
+	 * (measured, ~150 failures per 3 s), the compositor kept showing the last
+	 * frame it had, and the one GL_OUT_OF_MEMORY that got blamed for this for
+	 * several rounds landed immediately AFTER the first failed swap -- it was
+	 * a consequence, not the cause.
+	 *
+	 * A game should not let the screen sleep while it is on screen anyway,
+	 * and SDL turns this into FLAG_KEEP_SCREEN_ON on Android. The hint is set
+	 * before init so it applies to the window from creation. */
+	SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "0");
+
 	if (SDL_Init(SDL_INIT_VIDEO) != 0)
 	{
 		eprinterr("Failed to initialise SDL\n");
@@ -811,6 +827,10 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 		return;
 	}
 	
+	/* Belt and braces with the hint above: the hint covers the window from
+	 * creation, this covers a platform that only applies it on request. */
+	SDL_DisableScreenSaver();
+
 	if (!GR_InitialiseRender(windowNameStr, width, height, fullscreen))
 	{
 		eprinterr("Failed to Intialise Window\n");
@@ -909,6 +929,30 @@ int g_activeKeyboardControllers = 0x1;
 int g_PsyX_WheelUpFrames   = 0;
 int g_PsyX_WheelDownFrames = 0;
 
+/* Set while Android has taken the app off screen.
+ *
+ * SDL destroys the window surface then, and its release handshake waits for
+ * THIS thread to stop using the GL context first (onNativeSurfaceDestroyed in
+ * SDL_android.c retries 50 times waiting for backup_done, then gives up with
+ * "context probably still active"). Nothing here handled the app events, so
+ * the game kept drawing and swapping, the handshake always timed out, and the
+ * surface was left in a state onNativeSurfaceChanged will not rebuild -- which
+ * is why the cabinet froze permanently with eglSwapBuffers returning
+ * EGL_BAD_SURFACE on every frame while audio and input carried on.
+ *
+ * Honouring it costs nothing on desktop, where these events never arrive. */
+extern "C" { int g_PsyX_AppPaused = 0; }
+/* While Android has the window (backgrounded, or the surface being rebuilt)
+ * SDL has un-made the GL context current on this thread, so the game loop
+ * must not build a frame. It calls this instead: pump events so the resume
+ * is seen, then yield. */
+void PsyX_Sys_DoPollEvent();
+extern "C" void PsyX_PauseIdle(void)
+{
+	PsyX_Sys_DoPollEvent();
+	SDL_Delay(16);
+}
+
 void PsyX_Sys_DoPollEvent()
 {
 	SDL_Event event;
@@ -916,6 +960,18 @@ void PsyX_Sys_DoPollEvent()
 	{
 		switch (event.type)
 		{
+			case SDL_APP_WILLENTERBACKGROUND:
+			case SDL_APP_DIDENTERBACKGROUND:
+				/* Stop touching GL from here until we are back: that is what
+				 * lets SDL release the surface cleanly and rebuild it later. */
+				g_PsyX_AppPaused = 1;
+				eprintinfo("[LIFECYCLE] backgrounded; GL suspended\n");
+				break;
+			case SDL_APP_WILLENTERFOREGROUND:
+			case SDL_APP_DIDENTERFOREGROUND:
+				g_PsyX_AppPaused = 0;
+				eprintinfo("[LIFECYCLE] foregrounded; GL resumed\n");
+				break;
 			case SDL_CONTROLLERDEVICEADDED:
 				PsyX_Pad_Event_ControllerAdded(event.cdevice.which);
 				break;
@@ -1154,8 +1210,15 @@ void PsyX_EndScene()
 	/* PC port: draw overlays that must NOT be baked into the freeze-frame (the dev
 	 * console) — AFTER the capture, BEFORE the swap, so the console is a true live
 	 * overlay and never doubles against a frozen copy on pause / "no map" screens. */
-	if (g_PsyX_PostCaptureHook)
-		g_PsyX_PostCaptureHook();
+	/* Native resolution draws these after the present instead, at window size
+	 * (GR_SwapWindow). */
+	{
+		extern int          g_PcNativeRender;
+		extern unsigned int g_internalFBO;
+
+		if (g_PsyX_PostCaptureHook && !(g_PcNativeRender && g_internalFBO != 0))
+			g_PsyX_PostCaptureHook();
+	}
 
 	/* PC port: apply the selected full-screen post-process look (color grade,
 	 * CRT, scanlines, vignette, grain, sharpen, PSX downsample, ...) to the

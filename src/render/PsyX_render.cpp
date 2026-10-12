@@ -7622,6 +7622,18 @@ void GR_SwapWindow()
 						           sdlSurf, curDraw, (void*)wm.info.android.window,
 						           qok, w, (unsigned)qerr);
 						Swap_LogAndroidState("first failed swap");
+						{
+							FILE* mf = fopen("/proc/meminfo", "r");
+							char  ml[160];
+
+							eprintwarn("[SWAPDIAG] t=%us; /proc/meminfo at the first failure:\n", (unsigned)(SDL_GetTicks() / 1000));
+							if (mf != NULL)
+							{
+								while (fgets(ml, sizeof(ml), mf) != NULL)
+									eprintwarn("[MEMINFO] %s", ml);
+								fclose(mf);
+							}
+						}
 					}
 				}
 

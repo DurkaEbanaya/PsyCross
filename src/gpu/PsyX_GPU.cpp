@@ -30,6 +30,26 @@ extern "C" void GR_CaptureFrameToVramRect(int x, int y, int w, int h);
 int g_currentOTBucketCount = 0;
 float g_otBucketDepth = 0.0f;
 
+/* The OT bucket the game fills with 2D screen-space strings, or -1.
+ *
+ * The frame-class 3D marker below assumes a POLY on a 3D frame is world
+ * geometry, because the 2D content the game orders is SPRT and TILE. Scaled
+ * text breaks that assumption on purpose: a SPRT draws texels 1:1 and cannot be
+ * resized, so enlarged glyphs are emitted as POLY_FT4 instead -- and were then
+ * filtered as if they were a wall, which is what made big subtitles look soft
+ * and swollen in the world while the same text stayed crisp on a menu frame.
+ * The port names that bucket while the text is scaled; -1 means business as
+ * usual. Absolute index, i.e. the port's own OT tag index. */
+extern "C" { int g_PsxUi2dBucket = -1; }
+
+/* Absolute index of the bucket being walked (the walk runs far->near). */
+static int s_otBucketAbs = -1;
+
+static int OtBucketIsUi2d(void)
+{
+	return g_PsxUi2dBucket >= 0 && s_otBucketAbs == g_PsxUi2dBucket;
+}
+
 /* ----------------------------------------------------------------------------
  * PGXP (perspective-correct rendering) — shadow-memory model, DuckStation-faithful.
  *
@@ -701,6 +721,15 @@ static int s_curPrimIsFeedback = 0;
 /* The primitive samples the live scene-scratch rect: a soft-focus composite
  * strip (see GR_SceneFbRedirectCovers). Cleared per primitive. */
 static int s_curPrimIsScratch = 0;
+
+/* Host-supplied: does this tpage/CLUT pair address glyphs that must not be
+ * filtered (in this port, the kanji atlas: dense one-pixel strokes that a
+ * bilinear tap at four or five times their size runs together into blots)?
+ * Such a split is always point-sampled. NULL = none. */
+extern "C" int (*g_PsyX_TextGlyphTest)(int tpage, int clut);
+int (*g_PsyX_TextGlyphTest)(int tpage, int clut) = NULL;
+static int s_curPrimIsGlyph = 0;
+extern int g_PsxSplitIsGlyph;
 extern "C" int GR_SceneFbRedirectCovers(int x, int y);
 extern "C" float g_PsxFeedbackDampBlend;
 
@@ -711,6 +740,8 @@ static int s_curPrimR0 = 128;
 static inline void ApplyHiresOverride(int tpage, int clut)
 {
 	int nW = 0, nH = 0, offX = 0, offY = 0, hiW = 0, hiH = 0;
+
+	s_curPrimIsGlyph = (g_PsyX_TextGlyphTest != NULL) ? g_PsyX_TextGlyphTest(tpage, clut) : 0;
 
 	/* Framebuffer-feedback consumers announce themselves here: 16bpp (tp >= 2)
 	 * addressing the left 320 VRAM columns is the display-buffer band, which is
@@ -1712,6 +1743,8 @@ struct GPUDrawSplit
 	int				overrideHiresW;
 	int				overrideHiresH;
 
+	int				isGlyph; /* see g_PsyX_TextGlyphTest */
+
 	const char*		debugText;
 };
 
@@ -1886,7 +1919,7 @@ void MakeVertexTriangle(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* 
 	 * tree quads coming out blocky at 16x anisotropic. The lookup below still
 	 * runs and still sets the marker; this only removes the dependency on it
 	 * resolving, which it does for ~82% of vertices. */
-	if (g_PsxFrame3dClass && !g_PsyX_ForceItemDepth)
+	if (g_PsxFrame3dClass && !g_PsyX_ForceItemDepth && !OtBucketIsUi2d())
 		vertex[0].geom3d = vertex[1].geom3d = vertex[2].geom3d = 1.0f;
 
 	/* Before the PGXP block: the near-clip eligibility test below reads the
@@ -1954,7 +1987,7 @@ void MakeVertexQuad(GrVertex* vertex, VERTTYPE* p0, VERTTYPE* p1, VERTTYPE* p2, 
 	vertex[0].z = vertex[1].z = vertex[2].z = vertex[3].z = g_otBucketDepth;
 
 	/* Frame-class 3D marker, same reasoning as MakeVertexTriangle. */
-	if (g_PsxFrame3dClass && !g_PsyX_ForceItemDepth)
+	if (g_PsxFrame3dClass && !g_PsyX_ForceItemDepth && !OtBucketIsUi2d())
 	{
 		vertex[0].geom3d = vertex[1].geom3d =
 		vertex[2].geom3d = vertex[3].geom3d = 1.0f;
@@ -2278,6 +2311,11 @@ void MakeTexcoordRect(GrVertex* vertex, unsigned char* uv, short page, short clu
 	 * offset instead (a_extra.xy * 0.5 in the vertex shader, so 2 = +1 texel).
 	 * Genuine overflows past 256 keep the old clamp. */
 	int extendU = 0, extendV = 0;
+	/* The sprite's own texels end one BEFORE u+w / v+h -- the far edge is
+	 * exclusive and the hardware never reads it. Only meaningful when the
+	 * size went through untouched. */
+	const int lastU = (int(uv[0]) + w <= 255 && w > 0) ? int(uv[0]) + w - 1 : -1;
+	const int lastV = (int(uv[1]) + h <= 255 && h > 0) ? int(uv[1]) + h - 1 : -1;
 
 	if (int(uv[0]) + w == 256)     { w = 255 - uv[0]; extendU = 1; }
 	else if (int(uv[0]) + w > 255) { w = 255 - uv[0]; }
@@ -2349,6 +2387,17 @@ void MakeTexcoordRect(GrVertex* vertex, unsigned char* uv, short page, short clu
 	 * around P - 0.5 itself, so nothing needs compensating here. */
 
 	SetUvLimits(vertex, 4);
+
+	/* The filter's taps are clamped to this box, and a box ending at u+w / v+h
+	 * let them read the texel past the sprite: whatever VRAM held beside it,
+	 * drawn as a coloured line down the edge of the loading-screen picture
+	 * (and anything else built from abutting sprites). End it at the last
+	 * texel the sprite really shows. */
+	for (int i = 0; i < 4; i++)
+	{
+		if (lastU >= 0) vertex[i].uhi = (unsigned char)lastU;
+		if (lastV >= 0) vertex[i].vhi = (unsigned char)lastV;
+	}
 }
 
 void MakeTexcoordLineZero(GrVertex* vertex, unsigned char dither)
@@ -2882,6 +2931,7 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 		curSplit.drawenv.clip.w == activeDrawEnv.clip.w &&
 		curSplit.drawenv.clip.h == activeDrawEnv.clip.h &&
 		curSplit.drawenv.dfe == activeDrawEnv.dfe &&
+		curSplit.isGlyph == (textured ? s_curPrimIsGlyph : 0) &&
 		curSplit.debugText == currentSplitDebugText)
 	{
 		return;
@@ -2915,6 +2965,7 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 	split.drawenv = activeDrawEnv;
 	split.dispenv = activeDispEnv;
 	split.debugText = currentSplitDebugText;
+	split.isGlyph   = textured ? s_curPrimIsGlyph : 0;
 
 	split.drawenv.tw.w = overrideTextureWidth;
 	split.drawenv.tw.h = overrideTextureHeight;
@@ -3017,6 +3068,7 @@ void DrawSplit(const GPUDrawSplit& split)
 
 	GR_SetStencilMode(split.drawPrimMode);	// draw with mask 0x16
 
+	g_PsxSplitIsGlyph = split.isGlyph;
 	GR_SetTexture(split.textureId, split.texFormat);
 
 	if (split.texFormat == TF_32_BIT_RGBA)
@@ -3232,6 +3284,7 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 		// one depth value — matching the PSX's painter's-algorithm intent.
 		// g_otBucketDepth advances only at tagLength==0 bucket-boundary entries.
 		int otBucketIdx = 0;
+		s_otBucketAbs = -1;
 		const float otBucketStep = (g_currentOTBucketCount > 1)
 			? (2.0f / (float)(g_currentOTBucketCount - 1)) : 0.0f;
 		g_otBucketDepth = -1.0f;
@@ -3335,6 +3388,7 @@ void ParsePrimitivesLinkedList(u_long* p, int singlePrimitive)
 					g_otBucketDepth = -1.0f + (float)otBucketIdx * otBucketStep;
 					if (g_otBucketDepth > 1.0f) g_otBucketDepth = 1.0f;
 				}
+				s_otBucketAbs = g_currentOTBucketCount - 1 - otBucketIdx;
 				otBucketIdx++;
 			}
 			else if (tagLength > 32)
@@ -4293,6 +4347,7 @@ int ParsePrimitive(P_TAG* polyTag)
 	s_curPrimSemiTrans  = (polyTag->code & 2) ? 1 : 0;
 	s_curPrimIsFeedback = 0;
 	s_curPrimIsScratch  = 0;
+	s_curPrimIsGlyph    = 0;
 	s_curPrimR0         = polyTag->pad0; /* r0 in every prim struct */
 
 	switch (primType)

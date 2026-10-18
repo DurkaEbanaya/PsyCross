@@ -312,6 +312,8 @@ typedef enum
 	a_viewpos,
 	a_geom3d,
 	a_uvlim,
+	a_farP0,
+	a_farP1,
 } ShaderAttrib;
 
 typedef enum

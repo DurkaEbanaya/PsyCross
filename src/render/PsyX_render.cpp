@@ -2413,7 +2413,13 @@ int g_PsxFogToBlack = 0;
 		"			-3.0,  +1.0,  -4.0,  +0.0,\n"\
 		"			+3.0,  -1.0,  +2.0,  -2.0) / 255.0;\n"\
 		"		ivec2 dc = ivec2(fract(gl_FragCoord.xy / 8.0) * 4.0);\n"\
-		"		float dStrength = u_ditherForce * v_is3d * (1.0 - float(u_fogToBlack)) * (1.0 - fogAmt);\n"\
+		/* Untextured additive prims keep the dither: the PSX dithers gouraud
+		 * shading whatever the blend mode, and a faint additive gradient
+		 * quantized without it collapses into one hard 5-bit step (the sewer
+		 * water octagon read as two flat rings). The blood-decal leak above
+		 * was a textured subtractive prim, which stays excluded. */\
+		"		float addDither = (u_untextured > 0) ? 1.0 : (1.0 - float(u_fogToBlack));\n"\
+		"		float dStrength = u_ditherForce * v_is3d * addDither * (1.0 - fogAmt);\n"\
 		"		fragColor.xyz += vec3(dither[dc.x][dc.y] * dStrength);\n"\
 		"		if (u_ditherForce > 0.5 && v_is3d > 0.5) {\n"\
 		"		    vec3 qcol = floor(fragColor.xyz * 32.0 + 0.5) / 32.0;\n"\
@@ -2655,6 +2661,17 @@ int g_PsxFogToBlack = 0;
 	"	uniform float u_szMax;\n"\
 	"	uniform float u_pgxpFarW;\n"\
 	"	uniform float u_worldFarBias;\n"\
+	"	attribute vec4 a_farP0;\n"\
+	"	attribute vec4 a_farP1;\n"\
+	"	uniform int u_farMode;\n"\
+	"	uniform vec3 u_farR0;\n"\
+	"	uniform vec3 u_farR1;\n"\
+	"	uniform vec3 u_farR2;\n"\
+	"	uniform vec3 u_farBase;\n"\
+	"	uniform vec3 u_farEye;\n"\
+	"	uniform vec4 u_farProj;\n"\
+	"	uniform vec4 u_farFogP;\n"\
+	"	uniform vec4 u_farFogRamp[32];\n"\
 	"	const vec2 c_UVFudge = vec2(0.00025, 0.00025);\n"\
 	"	void main() {\n"\
 	"		v_texcoord = a_texcoord;\n"\
@@ -2667,7 +2684,29 @@ int g_PsxFogToBlack = 0;
 	"		v_page_clut.w = floor(a_position.w / 64.0) / 512.0;\n"\
 	"		v_page_clut.xy += c_UVFudge;\n"\
 	"		v_page_clut.zw += c_UVFudge;\n"\
+	"		float farFog = 0.0;\n"\
+	"		if (u_farMode > 0) {\n"\
+	"			vec3 fv = vec3(dot(u_farR0, a_pgxp), dot(u_farR1, a_pgxp), dot(u_farR2, a_pgxp)) + u_farBase;\n"\
+	"			float n012 = (a_farP0.w - dot(a_farP0.xyz, u_farEye)) * u_farFogP.w;\n"\
+	"			float n312 = (a_farP1.w - dot(a_farP1.xyz, u_farEye)) * u_farFogP.w;\n"\
+	"			vec4 b = Projection * vec4(u_farProj.y * fv.z + u_farProj.x * fv.x, u_farProj.z * fv.z + u_farProj.x * fv.y, 0.0, fv.z);\n"\
+	"			float zc = dot(u_farR2, a_viewpos) + u_farBase.z;\n"\
+	"			float zmax = zc + dot(abs(u_farR2), a_normal);\n"\
+	"			float dvz = min(fv.z + u_farProj.w * (zmax - fv.z) + u_worldFarBias, u_szMax);\n"\
+	"			b.z = (2.0 * dvz / u_szMax - 1.0) * b.w;\n"\
+	"			gl_Position = (n012 <= 0.0 && n312 >= 0.0) ? vec4(2.0, 2.0, 2.0, 1.0) : b;\n"\
+	"			float fi = floor(fv.z * u_farFogP.y);\n"\
+	"			float fb = 255.0;\n"\
+	"			if (fi < 128.0) {\n"\
+	"				int ii = int(max(fi, 0.0));\n"\
+	"				vec4 rr = u_farFogRamp[ii / 4];\n"\
+	"				int cc = ii - (ii / 4) * 4;\n"\
+	"				fb = (cc == 0) ? rr.x : ((cc == 1) ? rr.y : ((cc == 2) ? rr.z : rr.w));\n"\
+	"			}\n"\
+	"			farFog = (u_farFogP.x > 0.5) ? clamp(fb * 16.0 + u_farFogP.z, 0.0, 4096.0) / 4096.0 : 0.0;\n"\
+	"		} else {\n"\
 	GTE_PERSPECTIVE_CORRECTION\
+	"		}\n"\
 	/* v_is3d gates dither + bilinear so 2D logos/UI render sharp.
 	 * a_pgxp.z is the PGXP view W: > 0 only on vertices the GTE
 	 * actually projected, which is exactly the 3D content. It only
@@ -2698,6 +2737,14 @@ int g_PsxFogToBlack = 0;
 	"		float shadowInvZ = (a_viewpos.z > 0.0) ? (1.0 / a_viewpos.z) : 0.0;\n"\
 	"		float shadowClipW = (u_pgxpEnabled > 0 && a_pgxp.z > 0.0) ? ((u_pgxpFarW > 0.0) ? min(a_pgxp.z, u_pgxpFarW) : a_pgxp.z) : 1.0;\n"\
 	"		v_shadowViewPos = vec4(a_viewpos * shadowInvZ, shadowInvZ) * shadowClipW;\n"\
+	"		if (u_farMode > 0) {\n"\
+	"			v_is3d = 1.0;\n"\
+	"			v_fogAmount = farFog;\n"\
+	"			v_viewpos = vec3(0.0);\n"\
+	"			v_fade = 0.0;\n"\
+	"			v_geom3d = 1.0;\n"\
+	"			v_shadowViewPos = vec4(0.0);\n"\
+	"		}\n"\
 	"	}\n"
 
 /* Fog + per-pixel flashlight + shadow uniforms shared by every shader that
@@ -2750,7 +2797,11 @@ int g_PsxFogToBlack = 0;
 	 * are byte-identical. */\
 	"		if (u_untextured > 0) flAlbedo = fragColor.rgb;\n"\
 	/* Two flashlight styles, chosen by the UNIFORM u_flStyle (uniform control flow, so derivative use inside the branch is well-defined). 1 = CLASSIC: PSX-calibrated orientation-independent overlay -- no face normals, func_80057658-derived falloff, eased wide cone, 0.49 base dim. 0 = MODERN: stylized spotlight -- per-fragment Lambert from a dFdx/dFdy-reconstructed face normal, linear falloff, hard 0.15 dark surround. */\
-	"		if (u_flashlightOn > 0) {\n"\
+	/* Additive/subtractive prims (u_fogToBlack) are light and effects -- the
+	 * sewer water caustic, glows, fire -- which the PSX never lights. Dimming
+	 * them to the beam's base and adding the beam back on top made the water
+	 * near Harry blow out in the per-pixel modes while Classic was clean. */\
+	"		if (u_flashlightOn > 0 && u_fogToBlack == 0) {\n"\
 	"			vec3 flP = v_viewpos;\n"\
 	"			if (flP.z > 0.0) {\n"\
 	"				fragColor.rgb *= (u_flStyle > 0) ? 0.49 : 0.15;\n"\
@@ -2897,6 +2948,9 @@ int g_PsxFogToBlack = 0;
 	"			fragColor.rgb *= clamp(g_tapCov / g_tapWt, 0.0, 1.0);\n"\
 	GPU_LIT_TAIL\
 	GPU_DITHERING_NO_VCOLOR\
+	/* Additive blend is dst*alpha + src (GR_SetBlendMode): STP set (0.5 from
+	 * the LUT) adds, STP clear (1.0) draws solid, as the PSX does. */\
+	"		if (u_fogToBlack > 0) fragColor.a = (fragColor.a < 0.75) ? 1.0 : 0.0;\n"\
 	"	}\n"
 
 const char* gte_shader_4 =
@@ -2909,7 +2963,7 @@ const char* gte_shader_4 =
 	"varying vec3 v_viewpos;\n"
 	"varying float v_fade;\n"
 	"varying float v_geom3d;\n"
-	"varying vec4 v_uvlim;\n"
+	"AFFINE_VARYING vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
@@ -2927,7 +2981,7 @@ const char* gte_shader_8 =
 	"varying vec3 v_viewpos;\n"
 	"varying float v_fade;\n"
 	"varying float v_geom3d;\n"
-	"varying vec4 v_uvlim;\n"
+	"AFFINE_VARYING vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
@@ -2945,7 +2999,7 @@ const char* gte_shader_16 =
 	"varying vec3 v_viewpos;\n"
 	"varying float v_fade;\n"
 	"varying float v_geom3d;\n"
-	"varying vec4 v_uvlim;\n"
+	"AFFINE_VARYING vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
@@ -2963,7 +3017,7 @@ const char* gte_shader_32_rgba =
 	"varying vec3 v_viewpos;\n"
 	"varying float v_fade;\n"
 	"varying float v_geom3d;\n"
-	"varying vec4 v_uvlim;\n"
+	"AFFINE_VARYING vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
@@ -3019,6 +3073,7 @@ const char* gte_shader_32_rgba =
 	"		fragColor.a *= v_color.a;\n"\
 	GPU_LIT_TAIL\
 	GPU_DITHERING_NO_VCOLOR\
+	"		if (u_fogToBlack > 0) fragColor.a = 1.0;\n"\
 	"	}\n"
 	"#endif\n";
 
@@ -3306,6 +3361,8 @@ ShaderID GR_Shader_Compile(const char* source)
 	glBindAttribLocation(program, a_viewpos, "a_viewpos");
 	glBindAttribLocation(program, a_geom3d, "a_geom3d");
 	glBindAttribLocation(program, a_uvlim, "a_uvlim");
+	glBindAttribLocation(program, a_farP0, "a_farP0");
+	glBindAttribLocation(program, a_farP1, "a_farP1");
 
 	glLinkProgram(program);
 	if(GR_Shader_CheckProgramStatus(program) == 0)
@@ -3318,6 +3375,7 @@ ShaderID GR_Shader_Compile(const char* source)
 	/* Shaders without the decode table return location -1, where this is a no-op. */
 	glUniform1iv(glGetUniformLocation(program, "s_rgLut"), 1, &lutSampler);
 	glUseProgram(0);
+	g_PreviousShader = (ShaderID)-1;
 
 	return program;
 }
@@ -3411,9 +3469,87 @@ TextureID GR_CreateRGBATexture(int width, int height, u_char* data /*= nullptr*/
 	return newTexture;
 }
 
+/* Last value pushed per (program, uniform location). A dense outdoor frame has
+ * thousands of splits and GR_SetTexture re-pushes ~24 uniforms on each, nearly
+ * all unchanged; on weak drivers those calls are the frame's dominant CPU cost.
+ * Keyed on g_PreviousShader, so it relies on every foreign glUseProgram also
+ * resetting that to -1 (an unknown bound program always pushes). */
+typedef struct
+{
+	GLuint   prog;
+	GLint    loc;
+	int      n;
+	uint32_t v[16];
+} UniformCacheEntry;
+
+static UniformCacheEntry s_uniformCache[1024];
+
+static void GR_UniformCacheReset(void)
+{
+	memset(s_uniformCache, 0, sizeof(s_uniformCache));
+}
+
+static int GR_UniformChanged(GLint loc, const void* data, int n)
+{
+	UniformCacheEntry* e;
+	GLuint             prog;
+
+	if (loc == -1)
+		return 0;
+	if (g_PreviousShader == (ShaderID)-1)
+		return 1;
+	prog = (GLuint)g_PreviousShader;
+	e = &s_uniformCache[((prog * 97u) ^ (GLuint)loc) & 1023u];
+	if (e->prog == prog && e->loc == loc && e->n == n && memcmp(e->v, data, (size_t)n * 4) == 0)
+		return 0;
+	e->prog = prog;
+	e->loc  = loc;
+	e->n    = n;
+	memcpy(e->v, data, (size_t)n * 4);
+	return 1;
+}
+
+static void UC_1i(GLint loc, int x)
+{
+	if (GR_UniformChanged(loc, &x, 1))
+		glUniform1i(loc, x);
+}
+
+static void UC_1f(GLint loc, float x)
+{
+	if (GR_UniformChanged(loc, &x, 1))
+		glUniform1f(loc, x);
+}
+
+static void UC_2f(GLint loc, float x, float y)
+{
+	const float v[2] = { x, y };
+	if (GR_UniformChanged(loc, v, 2))
+		glUniform2fv(loc, 1, v);
+}
+
+static void UC_2fv(GLint loc, const float* v)
+{
+	if (GR_UniformChanged(loc, v, 2))
+		glUniform2fv(loc, 1, v);
+}
+
+static void UC_3fv(GLint loc, const float* v)
+{
+	if (GR_UniformChanged(loc, v, 3))
+		glUniform3fv(loc, 1, v);
+}
+
+static void UC_M4(GLint loc, const float* m)
+{
+	if (GR_UniformChanged(loc, m, 16))
+		glUniformMatrix4fv(loc, 1, GL_FALSE, m);
+}
+
 static void GR_InitialisePSXShader(GTEShader* sh, ShaderID shader)
 {
 	sh->shader = shader;
+	GR_UniformCacheReset();
 
 #if USE_OPENGL
 	
@@ -3707,7 +3843,7 @@ void GR_Ortho2D(float left, float right, float bottom, float top, float znear, f
 
 #if USE_OPENGL
 	{ extern unsigned g_PsyX_OrthoUp; g_PsyX_OrthoUp++; }
-	glUniformMatrix4fv(u_projectionLoc, 1, GL_FALSE, ortho);
+	UC_M4(u_projectionLoc, ortho);
 #endif
 }
 
@@ -3728,7 +3864,7 @@ void GR_Perspective3D(const float fov, const float width, const float height, co
 	};
 
 #if USE_OPENGL
-	glUniformMatrix4fv(u_projection3DLoc, 1, GL_FALSE, persp);
+	UC_M4(u_projection3DLoc, persp);
 #endif
 }
 
@@ -3977,47 +4113,47 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 * and forced-nearest sampling on actual 3D geometry (visible as
 	 * blocky tree leaves). */
 	if (u_pgxpEnabledLoc != -1)
-		glUniform1i(u_pgxpEnabledLoc, g_PsxUsePgxp);
+		UC_1i(u_pgxpEnabledLoc, g_PsxUsePgxp);
 
 	/* PGXP depth normalize: prev-frame max SZ. Lets the vertex shader turn each
 	 * vertex's unquantized SZ3 into continuous NDC depth (Z-fight fix). */
 	if (u_szMaxLoc != -1)
-		glUniform1f(u_szMaxLoc, PGXP_GetSzMax());
+		UC_1f(u_szMaxLoc, PGXP_GetSzMax());
 	if (u_worldFarBiasLoc != -1)
-		glUniform1f(u_worldFarBiasLoc, (float)g_PsxPgxpWorldFarBias);
+		UC_1f(u_worldFarBiasLoc, (float)g_PsxPgxpWorldFarBias);
 	{
 		extern float g_PgxpFarWClamp;
 		if (u_pgxpFarWLoc != -1)
-			glUniform1f(u_pgxpFarWLoc, g_PgxpFarWClamp);
+			UC_1f(u_pgxpFarWLoc, g_PgxpFarWClamp);
 	}
 
 	if (u_fogColorLoc != -1)
-		glUniform3fv(u_fogColorLoc, 1, g_PsyX_FogColor);
+		UC_3fv(u_fogColorLoc, g_PsyX_FogColor);
 	if (u_voidProbeLoc != -1)
-		glUniform1i(u_voidProbeLoc, g_PsxVoidProbeArmed == 2 ? 1 : 0);
+		UC_1i(u_voidProbeLoc, g_PsxVoidProbeArmed == 2 ? 1 : 0);
 
 	if (u_fogToBlackLoc != -1)
-		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
+		UC_1i(u_fogToBlackLoc, g_PsxFogToBlack);
 
 	if (u_fogStrengthLoc != -1)
-		glUniform1f(u_fogStrengthLoc, g_PsyX_FogStrength);
+		UC_1f(u_fogStrengthLoc, g_PsyX_FogStrength);
 
 	/* Per-pixel flashlight cone. u_flashlightOn is 0 unless BOTH the master
 	 * config flag and the per-frame game push are set, so the OFF path never
 	 * touches the spotlight branch (and the vsz>0 gate also keeps it off). */
 	if (u_flashlightOnLoc != -1)
-		glUniform1i(u_flashlightOnLoc,
+		UC_1i(u_flashlightOnLoc,
 		            (g_PsyX_UsePerPixelFlashlight && g_PsyX_FlashlightActive) ? 1 : 0);
 	/* Untextured splits bind g_whiteTexture; tell the lit tail so the beam's
 	 * albedo falls back to the vertex-lit color instead of full white. Keyed on
 	 * the caller's texture, not g_lastBoundTexture — this block runs before the
 	 * bind early-out, so it stays correct across program switches. */
 	if (u_untexturedLoc != -1)
-		glUniform1i(u_untexturedLoc, texture == g_whiteTexture ? 1 : 0);
+		UC_1i(u_untexturedLoc, texture == g_whiteTexture ? 1 : 0);
 	if (u_flStyleLoc != -1)
-		glUniform1i(u_flStyleLoc, g_PsyX_FlashlightStyle ? 1 : 0);
+		UC_1i(u_flStyleLoc, g_PsyX_FlashlightStyle ? 1 : 0);
 	if (u_flLightPosLoc != -1)
-		glUniform3fv(u_flLightPosLoc, 1, g_PsyX_FlashlightPos);
+		UC_3fv(u_flLightPosLoc, g_PsyX_FlashlightPos);
 
 	/* The cone collapses if any of these is degenerate -- a zero direction most of
 	 * all. Reported on change so a backend that lights wrongly can be compared
@@ -4042,7 +4178,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		}
 	}
 	if (u_flDirLoc != -1)
-		glUniform3fv(u_flDirLoc, 1, g_PsyX_FlashlightDir);
+		UC_3fv(u_flDirLoc, g_PsyX_FlashlightDir);
 	/* FPS mode swaps in its own (tighter/dimmer) cone size + brightness. */
 	float flIntensityActive = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightIntensityFps : g_PsyX_FlashlightIntensity;
 	float flSizeActive      = g_PsyX_FlashlightFpsMode ? g_PsyX_FlashlightSizeFps      : g_PsyX_FlashlightSize;
@@ -4051,7 +4187,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		flCol[0] = g_PsyX_FlashlightColor[0] * flIntensityActive;
 		flCol[1] = g_PsyX_FlashlightColor[1] * flIntensityActive;
 		flCol[2] = g_PsyX_FlashlightColor[2] * flIntensityActive;
-		glUniform3fv(u_flColorLoc, 1, flCol);
+		UC_3fv(u_flColorLoc, flCol);
 	}
 	/* Scale cone coverage by g_PsyX_FlashlightSize: a cone's solid angle is
 	 * ~proportional to (1 - cos(halfAngle)), so scaling that term scales the lit
@@ -4066,12 +4202,12 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		if (flInner < 0.05f) flInner = 0.05f;
 		if (flOuter < 0.05f) flOuter = 0.05f;
 		if (u_flInnerCosLoc != -1)
-			glUniform1f(u_flInnerCosLoc, flInner);
+			UC_1f(u_flInnerCosLoc, flInner);
 		if (u_flOuterCosLoc != -1)
-			glUniform1f(u_flOuterCosLoc, flOuter);
+			UC_1f(u_flOuterCosLoc, flOuter);
 	}
 	if (u_flRangeLoc != -1)
-		glUniform1f(u_flRangeLoc, g_PsyX_FlashlightRange);
+		UC_1f(u_flRangeLoc, g_PsyX_FlashlightRange);
 
 	/* Flashlight shadow map: same gate as the depth pre-pass in DrawAllSplits, so the
 	 * shader only samples the shadow texture on frames one was actually rendered. */
@@ -4111,23 +4247,23 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		}
 
 		if (u_shadowOnLoc != -1)
-			glUniform1i(u_shadowOnLoc, shadowOn);
+			UC_1i(u_shadowOnLoc, shadowOn);
 		if (shadowOn)
 		{
 			if (u_shadowMatrixLoc != -1)
-				glUniformMatrix4fv(u_shadowMatrixLoc, 1, GL_FALSE, g_shadowLightMatrix);
+				UC_M4(u_shadowMatrixLoc, g_shadowLightMatrix);
 			if (u_shadowBiasLoc != -1)
-				glUniform1f(u_shadowBiasLoc, g_PsyX_FlashlightShadowBias);
+				UC_1f(u_shadowBiasLoc, g_PsyX_FlashlightShadowBias);
 			if (u_shadowNormalOffsetLoc != -1)
-				glUniform1f(u_shadowNormalOffsetLoc, g_PsyX_FlashlightShadowNormalOffset);
+				UC_1f(u_shadowNormalOffsetLoc, g_PsyX_FlashlightShadowNormalOffset);
 			if (u_shadowStrengthLoc != -1)
-				glUniform1f(u_shadowStrengthLoc, g_PsyX_FlashlightShadowStrength);
+				UC_1f(u_shadowStrengthLoc, g_PsyX_FlashlightShadowStrength);
 			if (u_shadowClipLoc != -1)
-				glUniform2f(u_shadowClipLoc, g_shadowZNear, g_shadowZFar);
+				UC_2f(u_shadowClipLoc, g_shadowZNear, g_shadowZFar);
 			if (u_shadowFadeDistLoc != -1)
-				glUniform1f(u_shadowFadeDistLoc, g_PsyX_FlashlightShadowFadeDist);
+				UC_1f(u_shadowFadeDistLoc, g_PsyX_FlashlightShadowFadeDist);
 			if (u_shadowTexelLoc != -1)
-				glUniform2f(u_shadowTexelLoc, 1.0f / (float)PSYX_SHADOW_MAP_SIZE, 1.0f / (float)PSYX_SHADOW_MAP_SIZE);
+				UC_2f(u_shadowTexelLoc, 1.0f / (float)PSYX_SHADOW_MAP_SIZE, 1.0f / (float)PSYX_SHADOW_MAP_SIZE);
 			glActiveTexture(GL_TEXTURE1);
 			glBindTexture(GL_TEXTURE_2D, g_shadowDepthTex);
 			glActiveTexture(GL_TEXTURE0);
@@ -4150,7 +4286,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 * 2D-only states (menus, logos, inventory) without changing the
 	 * config flag. */
 	if (u_ditherForceLoc != -1)
-		glUniform1f(u_ditherForceLoc,
+		UC_1f(u_ditherForceLoc,
 		            (g_cfg_psxDither && !g_PsxDitherSuppressed) ? 1.0f : 0.0f);
 
 	/* Pixel scale = window width / PSX native (320). Scales the dither
@@ -4161,7 +4297,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 		float pixelScale = (g_windowWidth > 0)
 			? ((float)g_windowWidth / 320.0f)
 			: 1.0f;
-		glUniform1f(u_pixelScaleLoc, pixelScale);
+		UC_1f(u_pixelScaleLoc, pixelScale);
 	}
 
 	/* Filtering is a per-FRAME decision (the frame class flips with
@@ -4206,7 +4342,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 * magnified four or five times and bilinear-smoothed run into blots -- the
 	 * blurred Japanese and Chinese menus. Everything else keeps the filter. */
 	if (u_bilinearFilterLoc != -1)
-		glUniform1i(u_bilinearFilterLoc,
+		UC_1i(u_bilinearFilterLoc,
 		            g_PsxSplitIsGlyph       ? 0
 		            : g_PsxDitherSuppressed ? (g_cfg_menuFilter ? 2 : 0)
 		                                    : ((g_cfg_textureFilter > 0) ? 1 : 0));
@@ -4226,7 +4362,7 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 			if (taps < 1.0f)  taps = 1.0f;
 		}
 
-		glUniform1f(u_anisoTapsLoc, taps);
+		UC_1f(u_anisoTapsLoc, taps);
 	}
 
 	if (g_dbg_texturelessMode) {
@@ -4270,12 +4406,12 @@ void GR_SetOverrideTextureSize(int width, int height, int offsetX, int offsetY,
 	// clamp the divisor to >=1 to keep coords finite. Valid slots are unaffected.
 	float vec[] = { 1.0f / (float)(width  > 0 ? width  : 1),
 	                1.0f / (float)(height > 0 ? height : 1) };
-	glUniform2fv(u_texelSizeLoc, 1, vec);
+	UC_2fv(u_texelSizeLoc, vec);
 
 	if(u_texOffsetLoc != -1)
 	{
 		float ofs[] = { (float)offsetX, (float)offsetY };
-		glUniform2fv(u_texOffsetLoc, 1, ofs);
+		UC_2fv(u_texOffsetLoc, ofs);
 	}
 
 	if(u_hiresHalfLoc != -1)
@@ -4289,7 +4425,7 @@ void GR_SetOverrideTextureSize(int width, int height, int offsetX, int offsetY,
 		float hh[2];
 		hh[0] = (hx > 0.5f) ? 0.5f : hx;
 		hh[1] = (hy > 0.5f) ? 0.5f : hy;
-		glUniform2fv(u_hiresHalfLoc, 1, hh);
+		UC_2fv(u_hiresHalfLoc, hh);
 	}
 }
 
@@ -4337,50 +4473,6 @@ void GR_ClearVRAM(int x, int y, int w, int h, unsigned char r, unsigned char g, 
  * fogged geometry are landing on the same value and at which stage they
  * diverge. Fires once per arm; costs nothing otherwise. */
 extern "C" { int g_PsxVoidProbeArmed = 0; unsigned char g_PsxLastClearRGB[3] = { 0, 0, 0 }; }
-
-/* [GREYFRAME] -- the whole-screen grey flash: a presented frame that is exactly
- * the clear colour everywhere, while the world WAS submitted (the old
- * [GREYFLASH] vertex tally stayed normal through a recorded run of them, so the
- * geometry is drawn and lost, not missing). This watches the symptom itself:
- * three rows of the image actually presented are read back asynchronously each
- * swap, and a frame whose rows are one flat colour equal to its clear is
- * logged with the state it drew under. Silent otherwise; capped. */
-typedef struct
-{
-	unsigned frame;
-	int draws, tris, clears, clearsAfterDraw, clearFbo, offscreen, glerr;
-	int firstFbo, firstVp[4], firstSc, firstBox[4], firstMask[4], firstDTest, firstDFunc, firstProg, firstBlend;
-	int endFbo, endVp[4], endSc;
-	unsigned char clearRGB[3];
-	int tag[6];
-	int probe[6];   /* [PANELMISS] active, window x, y, expected rgb */
-	int pstate[16]; /* [PANELMISS] the panel's GL state at its draw */
-} GreyFrameSnap;
-
-static GreyFrameSnap s_gf;
-extern "C" { int g_PsxGreyTag[6] = { 0, 0, 0, 0, 0, 0 }; }
-/* [PANELMISS] armed each frame by an overlay that wants its presence checked in
- * the presented image (pc_bind_panel.c); consumed at the swap. */
-extern "C" { int g_PsxPanelProbe[6] = { 0 }; int g_PsxPanelState[16] = { 0 }; }
-
-static void GreyFrame_FirstDraw(void)
-{
-#if USE_OPENGL
-	GLboolean m[4] = { 1, 1, 1, 1 };
-	GLint     iv = 0;
-
-	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &iv); s_gf.firstFbo = iv;
-	glGetIntegerv(GL_VIEWPORT, s_gf.firstVp);
-	s_gf.firstSc = glIsEnabled(GL_SCISSOR_TEST) ? 1 : 0;
-	glGetIntegerv(GL_SCISSOR_BOX, s_gf.firstBox);
-	glGetBooleanv(GL_COLOR_WRITEMASK, m);
-	s_gf.firstMask[0] = m[0]; s_gf.firstMask[1] = m[1]; s_gf.firstMask[2] = m[2]; s_gf.firstMask[3] = m[3];
-	s_gf.firstDTest = glIsEnabled(GL_DEPTH_TEST) ? 1 : 0;
-	glGetIntegerv(GL_DEPTH_FUNC, &iv); s_gf.firstDFunc = iv;
-	glGetIntegerv(GL_CURRENT_PROGRAM, &iv); s_gf.firstProg = iv;
-	s_gf.firstBlend = glIsEnabled(GL_BLEND) ? 1 : 0;
-#endif
-}
 
 static void VoidProbeRows(const char* tag, GLuint readFbo, int w, int h)
 {
@@ -4470,18 +4562,6 @@ void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsi
 {
 	framebuffer_need_update = 1;
 	g_PsxLastClearRGB[0] = r; g_PsxLastClearRGB[1] = g; g_PsxLastClearRGB[2] = b;
-
-	s_gf.clears++;
-	if (s_gf.draws > 0)
-		s_gf.clearsAfterDraw++;
-	s_gf.clearRGB[0] = r; s_gf.clearRGB[1] = g; s_gf.clearRGB[2] = b;
-#if USE_OPENGL
-	{
-		GLint fbo = 0;
-		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
-		s_gf.clearFbo = fbo;
-	}
-#endif
 
 #if USE_OPENGL
 
@@ -4619,6 +4699,121 @@ void GR_SaveVRAM(const char* outputFileName, int x, int y, int width, int height
 #endif
 }
 
+/* Re-stamp a rect of vram[] into both VRAM textures (no full re-upload). */
+static void GR_UploadVramRect(int x, int y, int w, int h)
+{
+#if USE_OPENGL
+	static unsigned short s_packed[64 * 64];
+	if (w <= 0 || h <= 0 || w * h > 64 * 64)
+		return;
+	for (int row = 0; row < h; row++)
+		memcpy(&s_packed[row * w], vram + (size_t)(y + row) * VRAM_WIDTH + x, w * sizeof(unsigned short));
+	for (int t = 0; t < 2; t++)
+	{
+		glBindTexture(GL_TEXTURE_2D, g_vramTexturesDouble[t]);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, VRAM_FORMAT, GL_UNSIGNED_BYTE, s_packed);
+	}
+	glBindTexture(GL_TEXTURE_2D, g_lastBoundTexture);
+#endif
+}
+
+/* The sewer water caustic (water.c func_8008E5B4) composites two scrolled
+ * copies of a 4bpp wave texture into a 32x32 VRAM tile that the water
+ * surface then samples back as a 4bpp texture through a DIFFERENT palette:
+ * every 16-bit colour word becomes four palette indices, so the pattern is
+ * only right if the words are bit-exact PSX GPU output. The GL offscreen
+ * round trip (shader modulation, filtering, dither, an RGBA8 readback and a
+ * repack whose STP bit was wrong) is not, and the water read as mid-grey
+ * noise with the flashlight's dark octagon showing through. Rasterize the
+ * axis-aligned 1:1 rect here with the GPU's own arithmetic: texel fetch
+ * through the CLUT, texel 0 transparent, the 4x4 ordered dither on modulated
+ * texels, 5-bit saturating semi-transparency per abr mode, and the texel's
+ * STP bit carried into bit 15. */
+extern "C" void PsyX_VramDrawTexturedRect(int dstX, int dstY, int w, int h, int tpage, int clut,
+                                          int u0, int v0, int semiTrans, int dither)
+{
+	static const int s_dither[4][4] = { { -4, 0, -3, 1 }, { 2, -2, 3, -1 }, { -3, 1, -4, 0 }, { 3, -1, 2, -2 } };
+	const int tpX   = (tpage & 0xF) * 64;
+	const int tpY   = ((tpage >> 4) & 1) * 256;
+	const int abr   = (tpage >> 5) & 3;
+	const int depth = (tpage >> 7) & 3;
+	const int clutX = (clut & 0x3F) * 16;
+	const int clutY = (clut >> 6) & 0x1FF;
+
+	if (w <= 0 || h <= 0 || dstX < 0 || dstY < 0 || dstX + w > VRAM_WIDTH || dstY + h > VRAM_HEIGHT)
+		return;
+
+	for (int y = 0; y < h; y++)
+	{
+		const int             v   = (v0 + y) & 255;
+		const unsigned short* row = vram + (size_t)((tpY + v) & (VRAM_HEIGHT - 1)) * VRAM_WIDTH;
+		unsigned short*       dst = vram + (size_t)(dstY + y) * VRAM_WIDTH + dstX;
+
+		for (int x = 0; x < w; x++)
+		{
+			const int      u = (u0 + x) & 255;
+			unsigned short texel;
+
+			if (depth == 0)
+			{
+				const unsigned short word = row[(tpX + (u >> 2)) & (VRAM_WIDTH - 1)];
+				texel = vram[(size_t)clutY * VRAM_WIDTH + ((clutX + ((word >> ((u & 3) * 4)) & 0xF)) & (VRAM_WIDTH - 1))];
+			}
+			else if (depth == 1)
+			{
+				const unsigned short word = row[(tpX + (u >> 1)) & (VRAM_WIDTH - 1)];
+				texel = vram[(size_t)clutY * VRAM_WIDTH + ((clutX + ((word >> ((u & 1) * 8)) & 0xFF)) & (VRAM_WIDTH - 1))];
+			}
+			else
+			{
+				texel = row[(tpX + u) & (VRAM_WIDTH - 1)];
+			}
+
+			if (texel == 0)
+				continue;
+
+			int       c[3] = { texel & 31, (texel >> 5) & 31, (texel >> 10) & 31 };
+			const int stp  = (texel >> 15) & 1;
+
+			if (dither)
+			{
+				const int d = s_dither[y & 3][x & 3];
+				for (int k = 0; k < 3; k++)
+				{
+					int e = (c[k] << 3) + d;
+					if (e < 0) e = 0;
+					if (e > 255) e = 255;
+					c[k] = e >> 3;
+				}
+			}
+
+			if (semiTrans && stp)
+			{
+				const unsigned short back = dst[x];
+				const int b[3] = { back & 31, (back >> 5) & 31, (back >> 10) & 31 };
+				for (int k = 0; k < 3; k++)
+				{
+					int e;
+					switch (abr)
+					{
+					case 0:  e = (b[k] + c[k]) >> 1; break;
+					case 1:  e = b[k] + c[k]; break;
+					case 2:  e = b[k] - c[k]; break;
+					default: e = b[k] + (c[k] >> 2); break;
+					}
+					if (e < 0) e = 0;
+					if (e > 31) e = 31;
+					c[k] = e;
+				}
+			}
+
+			dst[x] = (unsigned short)(c[0] | (c[1] << 5) | (c[2] << 10) | (stp << 15));
+		}
+	}
+
+	GR_UploadVramRect(dstX, dstY, w, h);
+}
+
 void GR_CopyRGBAFramebufferToVRAM(u_int* src, int x, int y, int w, int h, int update_vram, int flip_y)
 {
 	assert(x >= 0);
@@ -4641,7 +4836,7 @@ void GR_CopyRGBAFramebufferToVRAM(u_int* src, int x, int y, int w, int h, int up
 			u_char r = ((c >> 19) & 0x1F);
 			//u_char a = ((c >> 24) & 0x1F);
 
-			int a = r == g == b == 0 ? 0 : 1;
+			int a = (r | g | b) ? 1 : 0;
 
 			*data_dst++ = r | (g << 5) | (b << 10) | (a << 15);
 		}
@@ -4715,10 +4910,13 @@ void GR_SetScissorState(int enable)
 		return;
 
 #if USE_OPENGL
-	if (g_PreviousScissorState)
-		glDisable(GL_SCISSOR_TEST);
-	else
+	/* Keyed on the request, not on the tracker: with the -999 sentinel the
+	 * shadow pass leaves behind, toggling off the old value applied the
+	 * opposite of what was asked. */
+	if (enable)
 		glEnable(GL_SCISSOR_TEST);
+	else
+		glDisable(GL_SCISSOR_TEST);
 #endif
 	g_PreviousScissorState = enable;
 }
@@ -5158,8 +5356,6 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 		return;
 
 	g_PreviousOffscreenState = enable;
-	if (enable)
-		s_gf.offscreen++;
 
 #if USE_OPENGL
 	if (enable)
@@ -5214,7 +5410,6 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 			 * the packed region into BOTH double-buffered VRAM textures.
 			 * vram_need_update is NOT set — no 1MB full re-upload per frame. */
 			static u_int  s_scratchRGBA[64 * 64];
-			static ushort s_scratchPacked[64 * 64];
 			const int sw = g_PreviousOffscreen.w, sh = g_PreviousOffscreen.h;
 
 			glBindFramebuffer(GL_FRAMEBUFFER, g_glOffscreenFramebuffer);
@@ -5224,21 +5419,7 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 			GR_CopyRGBAFramebufferToVRAM(s_scratchRGBA,
 				g_PreviousOffscreen.x, g_PreviousOffscreen.y, sw, sh, 0, 1);
 
-			{
-				const ushort* src = (const ushort*)vram +
-					VRAM_WIDTH * g_PreviousOffscreen.y + g_PreviousOffscreen.x;
-				for (int row = 0; row < sh; row++)
-					memcpy(&s_scratchPacked[row * sw], src + row * VRAM_WIDTH, sw * sizeof(ushort));
-
-				for (int t = 0; t < 2; t++)
-				{
-					glBindTexture(GL_TEXTURE_2D, g_vramTexturesDouble[t]);
-					glTexSubImage2D(GL_TEXTURE_2D, 0,
-						g_PreviousOffscreen.x, g_PreviousOffscreen.y, sw, sh,
-						VRAM_FORMAT, GL_UNSIGNED_BYTE, s_scratchPacked);
-				}
-				glBindTexture(GL_TEXTURE_2D, g_lastBoundTexture);
-			}
+			GR_UploadVramRect(g_PreviousOffscreen.x, g_PreviousOffscreen.y, sw, sh);
 		}
 		else
 		{
@@ -5882,12 +6063,9 @@ static void GR_BuildShadowMatrix(void)
 
 int GR_FlashlightShadowActive(void)
 {
-	/* g_PsyX_ShadowsAllowed is re-armed by the game only during settled gameplay
-	 * (see its definition). Outside that — menus, room-load fades, cutscenes and
-	 * frozen/transition frames (g_PsxPresentLastFrame) — the light-POV depth
-	 * pre-pass corrupts unrelated rendering (white flash on room/inventory/map
-	 * transitions, Harry's face dropping out on the options screen). Shadows are a
-	 * live-gameplay-only effect. */
+	/* g_PsyX_ShadowsAllowed is re-armed by the game on every frame the world
+	 * was submitted (see its definition); 2D screens and frozen re-presented
+	 * frames (g_PsxPresentLastFrame) leave it 0 and sample nothing new. */
 	return (g_PsyX_UseFlashlightShadows && g_PsyX_UsePerPixelFlashlight &&
 	        g_PsyX_FlashlightActive && g_PsyX_ShadowsAllowed &&
 	        !g_PsxPresentLastFrame) ? 1 : 0;
@@ -6429,6 +6607,7 @@ static void GR_EnsureFbPackTarget(int w, int h)
 			if (loc != -1) glUniform1i(loc, 0);
 		}
 		glUseProgram(0);
+		g_PreviousShader = (ShaderID)-1;
 		glGenVertexArrays(1, &g_fbPackVAO);
 		glGenTextures(1, &g_fbPackTex);
 		glGenFramebuffers(1, &g_fbPackFBO);
@@ -7268,12 +7447,18 @@ void GR_DiagGLError(const char* where)
 	static unsigned    s_hits[16];
 	static unsigned    s_nextMs[16];
 	static int         s_seenCount = 0;
+	static int         s_esChecks  = 0;
 	GLenum             err;
 	int                i, slot = -1;
 	unsigned           now;
 
-	if (!g_grIsGLES && !g_dbg_glDiag)
+	/* ES backends sweep only the first ~10 s of frames (the black-from-boot
+	 * case this exists for); glGetError can serialise a mobile driver, so it
+	 * must not run every frame for the whole session. */
+	if (!g_dbg_glDiag && (!g_grIsGLES || s_esChecks >= 1200))
 		return;
+	if (!g_dbg_glDiag)
+		s_esChecks++;
 
 	err = glGetError();
 	if (err == GL_NO_ERROR)
@@ -7306,133 +7491,6 @@ void GR_DiagGLError(const char* where)
 		(unsigned)err, where, s_hits[slot], PsyX_Backend_GetName(g_grActiveBackend));
 	s_hits[slot]   = 0;
 	s_nextMs[slot] = now + 3000u;
-}
-
-/* [GREYFRAME] per-swap half, run on the window framebuffer right before the
- * swap, i.e. on exactly the image that is presented. Four pack buffers in a
- * ring: each swap queues this frame's rows and inspects the slot it is about to
- * reuse, four presents old, which has long finished -- no stall. */
-static void GreyFrame_Present(int w, int h)
-{
-#if USE_OPENGL
-	static GLuint        s_pbo[4];
-	static int           s_pboW[4];
-	static GreyFrameSnap s_ring[4];
-	static int           s_idx = 0, s_filled = 0, s_logs = 0, s_plogs = 0;
-	static unsigned      s_frame = 0;
-	GLint                prevRead = 0, prevPack = 0, fbo = 0;
-	const int            slot = s_idx;
-
-	if (g_grIsGLES || w <= 0 || h <= 0)
-		return;
-
-	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
-	s_gf.endFbo = fbo;
-	glGetIntegerv(GL_VIEWPORT, s_gf.endVp);
-	s_gf.endSc  = glIsEnabled(GL_SCISSOR_TEST) ? 1 : 0;
-	s_gf.glerr  = (int)glGetError();
-	s_gf.frame  = ++s_frame;
-	memcpy(s_gf.tag, g_PsxGreyTag, sizeof(s_gf.tag));
-	memcpy(s_gf.probe, g_PsxPanelProbe, sizeof(s_gf.probe));
-	memcpy(s_gf.pstate, g_PsxPanelState, sizeof(s_gf.pstate));
-	g_PsxPanelProbe[0] = 0;
-
-	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
-	glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prevPack);
-
-	if (s_pbo[0] == 0)
-		glGenBuffers(4, s_pbo);
-
-	/* The slot about to be reused holds the frame presented four swaps ago. */
-	if (s_filled >= 4 && (s_logs < 40 || s_plogs < 40))
-	{
-		const GreyFrameSnap* g = &s_ring[slot];
-		const int            n = s_pboW[slot] * 3;
-		const unsigned char* px;
-
-		glBindBuffer(GL_PIXEL_PACK_BUFFER, s_pbo[slot]);
-		px = (const unsigned char*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, n * 4 + 4, GL_MAP_READ_BIT);
-		if (px)
-		{
-			int i, flat = 1;
-
-			/* [PANELMISS] the overlay's own title-band pixel, in the image that
-			 * was presented. */
-			if (g->probe[0] && s_plogs < 40)
-			{
-				const unsigned char* q = px + n * 4;
-
-				/* One line proving the check is live, so a session with no
-				 * misses reads as "every frame had the panel", not "the probe
-				 * never ran". */
-				{
-					static int s_live = 0;
-					if (!s_live)
-					{
-						s_live = 1;
-						eprintinfo("[PANELMISS] check live: frame=%u at=(%d,%d) got=(%d,%d,%d) want=(%d,%d,%d)\n",
-							g->frame, g->probe[1], g->probe[2], q[0], q[1], q[2],
-							g->probe[3], g->probe[4], g->probe[5]);
-					}
-				}
-				const int dr = (int)q[0] - g->probe[3], dg = (int)q[1] - g->probe[4], db = (int)q[2] - g->probe[5];
-				if (dr * dr + dg * dg + db * db > 3 * 10 * 10)
-				{
-					const int* st = g->pstate;
-					s_plogs++;
-					eprintinfo("[PANELMISS] frame=%u at=(%d,%d) got=(%d,%d,%d) want=(%d,%d,%d) | draw fbo=%d sc=%d box=%d,%d,%d,%d stencil=%d func=0x%x ref=%d mask=0x%x vp=%dx%d prog=%d tex=%d glerr=0x%x phase=%d | end fbo=%d vp=%d,%d,%d,%d sc=%d glerr=0x%x | game=%d sys=%d vbl=%d world=%d freeze=%d\n",
-						g->frame, g->probe[1], g->probe[2], q[0], q[1], q[2], g->probe[3], g->probe[4], g->probe[5],
-						st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], st[11],
-						st[12], st[13], st[14], st[15],
-						g->endFbo, g->endVp[0], g->endVp[1], g->endVp[2], g->endVp[3], g->endSc, g->glerr,
-						g->tag[0], g->tag[1], g->tag[2], g->tag[3], g->tag[5]);
-				}
-			}
-			for (i = 1; i < n && flat; i++)
-				flat = px[i * 4] == px[0] && px[i * 4 + 1] == px[1] && px[i * 4 + 2] == px[2];
-
-			/* Black is every fade and loading gap; only a flat NON-black frame
-			 * that is exactly its own clear is the flash. */
-			if (s_logs < 40 && flat && (px[0] | px[1] | px[2]) > 8 &&
-			    px[0] == g->clearRGB[0] && px[1] == g->clearRGB[1] && px[2] == g->clearRGB[2])
-			{
-				s_logs++;
-				eprintinfo("[GREYFRAME] frame=%u rgb=(%d,%d,%d) draws=%d tris=%d clears=%d clearsAfterDraw=%d clearFbo=%d offscreen=%d glerr=0x%x | first fbo=%d vp=%d,%d,%d,%d sc=%d box=%d,%d,%d,%d mask=%d%d%d%d dtest=%d dfunc=0x%x prog=%d blend=%d | end fbo=%d vp=%d,%d,%d,%d sc=%d | game=%d sys=%d vbl=%d world=%d dt=%d freeze=%d\n",
-					g->frame, px[0], px[1], px[2], g->draws, g->tris, g->clears, g->clearsAfterDraw, g->clearFbo,
-					g->offscreen, g->glerr,
-					g->firstFbo, g->firstVp[0], g->firstVp[1], g->firstVp[2], g->firstVp[3],
-					g->firstSc, g->firstBox[0], g->firstBox[1], g->firstBox[2], g->firstBox[3],
-					g->firstMask[0], g->firstMask[1], g->firstMask[2], g->firstMask[3],
-					g->firstDTest, g->firstDFunc, g->firstProg, g->firstBlend,
-					g->endFbo, g->endVp[0], g->endVp[1], g->endVp[2], g->endVp[3], g->endSc,
-					g->tag[0], g->tag[1], g->tag[2], g->tag[3], g->tag[4], g->tag[5]);
-			}
-			glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-		}
-	}
-
-	glBindBuffer(GL_PIXEL_PACK_BUFFER, s_pbo[slot]);
-	if (s_pboW[slot] != w)
-	{
-		glBufferData(GL_PIXEL_PACK_BUFFER, w * 3 * 4 + 4, NULL, GL_STREAM_READ);
-		s_pboW[slot] = w;
-	}
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-	glReadPixels(0, h / 4,     w, 1, GL_RGBA, GL_UNSIGNED_BYTE, (void*)(uintptr_t)0);
-	glReadPixels(0, h / 2,     w, 1, GL_RGBA, GL_UNSIGNED_BYTE, (void*)(uintptr_t)(w * 4));
-	glReadPixels(0, h * 3 / 4, w, 1, GL_RGBA, GL_UNSIGNED_BYTE, (void*)(uintptr_t)(w * 8));
-	if (s_gf.probe[0])
-		glReadPixels(s_gf.probe[1], s_gf.probe[2], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, (void*)(uintptr_t)(w * 12));
-
-	glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)prevPack);
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevRead);
-
-	s_ring[slot] = s_gf;
-	s_idx = (slot + 1) & 3;
-	if (s_filled < 4)
-		s_filled++;
-#endif
-	memset(&s_gf, 0, sizeof(s_gf));
 }
 
 void GR_SwapWindow()
@@ -7506,10 +7564,14 @@ void GR_SwapWindow()
 	{
 		static unsigned s_seenErrBits = 0;
 		static int      s_errLogged   = 0;
+		static int      s_swapChecks  = 0;
 		int             drain;
 		/* glGetError can force a driver sync; on a weak GPU that is a real cost
-		 * for a diagnostic nobody is reading during play. */
-		const int       maxDrain = g_cfg_lowEnd ? 0 : 8;
+		 * for a diagnostic nobody is reading during play. Same window as
+		 * GR_DiagGLError: the first ~1200 frames, or always under gldiag. */
+		const int       maxDrain = (g_cfg_lowEnd || (!g_dbg_glDiag && s_swapChecks >= 1200)) ? 0 : 8;
+		if (s_swapChecks < 1200)
+			s_swapChecks++;
 		for (drain = 0; drain < maxDrain; drain++)
 		{
 			const GLenum err = glGetError();
@@ -7531,8 +7593,6 @@ void GR_SwapWindow()
 		PsyX_Angle_Swap();
 	else
 	{
-		GreyFrame_Present(g_internalFBO ? g_presentWidth : g_windowWidth,
-		                  g_internalFBO ? g_presentHeight : g_windowHeight);
 		{
 			/* Android owns the surface while the app is in the background, and
 			 * SDL has made the context non-current on this thread; presenting
@@ -7697,6 +7757,12 @@ void GR_SetStencilMode(int drawPrim)
 #endif
 }
 
+extern "C" unsigned short PsyX_VramRead(int x, int y)
+{
+	if (x < 0 || y < 0 || x >= VRAM_WIDTH || y >= VRAM_HEIGHT) return 0;
+	return vram[(size_t)y * VRAM_WIDTH + x];
+}
+
 void GR_SetBlendMode(BlendMode blendMode)
 {
 	if (g_PreviousBlendMode == blendMode)
@@ -7715,7 +7781,7 @@ void GR_SetBlendMode(BlendMode blendMode)
 	g_PsxFogToBlack = (blendMode == BM_ADD || blendMode == BM_SUBTRACT ||
 	                   blendMode == BM_ADD_QUATER_SOURCE) ? 1 : 0;
 	if (u_fogToBlackLoc != -1)
-		glUniform1i(u_fogToBlackLoc, g_PsxFogToBlack);
+		UC_1i(u_fogToBlackLoc, g_PsxFogToBlack);
 	if (blendMode == BM_NONE)
 	{
 		if (g_PreviousBlendMode != BM_NONE)
@@ -7750,6 +7816,16 @@ void GR_SetBlendMode(BlendMode blendMode)
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 		break;
 	case BM_ADD:
+		/* The texel's STP bit decides whether a semi-transparent prim blends
+		 * it or draws it solid (the sampler already maps clear -> 1.0, set ->
+		 * 0.5, which is what BM_AVERAGE's SRC_ALPHA blend relies on). The
+		 * shaders fold that into alpha = 1 (add) / 0 (solid) for additive
+		 * prims, so dst*alpha + src gives both cases. GL_ONE,GL_ONE added the
+		 * solid texels too: the sewer water surface, whose palette entries
+		 * are mostly STP-clear, let the flashlight's dark octagon show
+		 * through where the PSX covered it. */
+		glBlendFunc(GL_ONE, GL_SRC_ALPHA);
+		break;
 	case BM_SUBTRACT:
 		glBlendFunc(GL_ONE, GL_ONE);
 		break;
@@ -7907,6 +7983,159 @@ int GR_DrawModernMesh(unsigned int mesh_handle)
 	return 1;
 }
 
+/* Whole-map GPU far meshes: static per-chunk geometry, projected by the GTE
+ * shaders' u_farMode branch. Own VAO per mesh; the frame VAO is rebound after
+ * every touch so the legacy stream never notices. */
+struct FarMeshGL { GLuint vao, vbo, ibo; };
+#define FAR_MESH_GL_MAX 1024
+static FarMeshGL s_farMeshGL[FAR_MESH_GL_MAX];
+
+struct FarMeshLocs { GLuint prog; GLint mode, r0, r1, r2, base, eye, proj, fogP, ramp; };
+static FarMeshLocs s_farMeshLocs[8];
+static FarMeshLocs* s_farMeshCur = NULL;
+
+static void GR_FarMeshRestoreFrameVao()
+{
+	glBindVertexArray(g_glVertexArray[g_curVertexBuffer ^ 1]);
+	glBindBuffer(GL_ARRAY_BUFFER, g_glVertexBuffer[g_curVertexBuffer ^ 1]);
+}
+
+extern "C" unsigned GR_FarMeshUpload(unsigned handle, const PsyX_FarMeshVertex* v, int vertexCount,
+                                     const unsigned* indices, int indexCount)
+{
+	if (handle == 0)
+	{
+		for (int i = 0; i < FAR_MESH_GL_MAX; i++)
+		{
+			if (s_farMeshGL[i].vao == 0)
+			{
+				glGenVertexArrays(1, &s_farMeshGL[i].vao);
+				glGenBuffers(1, &s_farMeshGL[i].vbo);
+				glGenBuffers(1, &s_farMeshGL[i].ibo);
+				handle = (unsigned)i + 1;
+				break;
+			}
+		}
+		if (handle == 0)
+			return 0;
+	}
+	else if (handle > FAR_MESH_GL_MAX || s_farMeshGL[handle - 1].vao == 0)
+		return 0;
+
+	FarMeshGL& m = s_farMeshGL[handle - 1];
+	const GLsizei st = sizeof(PsyX_FarMeshVertex);
+	glBindVertexArray(m.vao);
+	glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
+	glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertexCount * st, v, GL_STATIC_DRAW);
+	glVertexAttribPointer(a_position, 4, GL_SHORT, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->x);
+	glEnableVertexAttribArray(a_position);
+	glVertexAttribPointer(a_texcoord, 4, GL_UNSIGNED_BYTE, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->u);
+	glEnableVertexAttribArray(a_texcoord);
+	glVertexAttribPointer(a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE, st, &((PsyX_FarMeshVertex*)NULL)->r);
+	glEnableVertexAttribArray(a_color);
+	glVertexAttribPointer(a_extra, 4, GL_BYTE, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->tcx);
+	glEnableVertexAttribArray(a_extra);
+	glVertexAttribPointer(a_pgxp, 3, GL_FLOAT, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->px);
+	glEnableVertexAttribArray(a_pgxp);
+	glVertexAttribPointer(a_viewpos, 3, GL_FLOAT, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->cx);
+	glEnableVertexAttribArray(a_viewpos);
+	glVertexAttribPointer(a_normal, 3, GL_FLOAT, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->hx);
+	glEnableVertexAttribArray(a_normal);
+	glVertexAttribPointer(a_uvlim, 4, GL_UNSIGNED_BYTE, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->ulo);
+	glEnableVertexAttribArray(a_uvlim);
+	glVertexAttribPointer(a_farP0, 4, GL_FLOAT, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->plane0);
+	glEnableVertexAttribArray(a_farP0);
+	glVertexAttribPointer(a_farP1, 4, GL_FLOAT, GL_FALSE, st, &((PsyX_FarMeshVertex*)NULL)->plane1);
+	glEnableVertexAttribArray(a_farP1);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m.ibo);
+	glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)indexCount * sizeof(unsigned), indices, GL_STATIC_DRAW);
+	GR_FarMeshRestoreFrameVao();
+	return handle;
+}
+
+extern "C" void GR_FarMeshFree(unsigned handle)
+{
+	if (handle == 0 || handle > FAR_MESH_GL_MAX || s_farMeshGL[handle - 1].vao == 0)
+		return;
+	FarMeshGL& m = s_farMeshGL[handle - 1];
+	glDeleteVertexArrays(1, &m.vao);
+	glDeleteBuffers(1, &m.vbo);
+	glDeleteBuffers(1, &m.ibo);
+	m.vao = m.vbo = m.ibo = 0;
+	GR_FarMeshRestoreFrameVao();
+}
+
+/* Pushes the frame's far camera onto the program GR_SetTexture just bound. */
+extern "C" void GR_FarMeshSetUniforms(const PsyX_FarMeshFrame* f, float ofsX, float ofsY, float layerK)
+{
+	const GLuint prog = (GLuint)g_PreviousShader;
+	FarMeshLocs* L = NULL;
+	for (int i = 0; i < 8; i++)
+	{
+		if (s_farMeshLocs[i].prog == prog) { L = &s_farMeshLocs[i]; break; }
+		if (s_farMeshLocs[i].prog == 0)
+		{
+			L = &s_farMeshLocs[i];
+			L->prog = prog;
+			L->mode = glGetUniformLocation(prog, "u_farMode");
+			L->r0   = glGetUniformLocation(prog, "u_farR0");
+			L->r1   = glGetUniformLocation(prog, "u_farR1");
+			L->r2   = glGetUniformLocation(prog, "u_farR2");
+			L->base = glGetUniformLocation(prog, "u_farBase");
+			L->eye  = glGetUniformLocation(prog, "u_farEye");
+			L->proj = glGetUniformLocation(prog, "u_farProj");
+			L->fogP = glGetUniformLocation(prog, "u_farFogP");
+			L->ramp = glGetUniformLocation(prog, "u_farFogRamp");
+			break;
+		}
+	}
+	s_farMeshCur = L;
+	if (L == NULL || L->mode == -1)
+		return;
+	float ramp[128];
+	for (int i = 0; i < 128; i++)
+		ramp[i] = (float)f->fogRamp[i];
+	const float proj[4] = { f->h, f->ofsX + ofsX, f->ofsY + ofsY, layerK };
+	const float fogP[4] = { (float)(f->fogOn != 0), 128.0f / (float)(1u << (f->fogShift & 31)),
+	                        (float)f->fogIntensity, f->detSign };
+	glUniform1i(L->mode, 1);
+	glUniform3fv(L->r0, 1, &f->rot[0]);
+	glUniform3fv(L->r1, 1, &f->rot[3]);
+	glUniform3fv(L->r2, 1, &f->rot[6]);
+	glUniform4fv(L->proj, 1, proj);
+	glUniform4fv(L->fogP, 1, fogP);
+	glUniform4fv(L->ramp, 32, ramp);
+}
+
+extern "C" void GR_FarMeshDraw(unsigned handle, const float base[3], const float eye[3], int firstIndex, int indexCount)
+{
+	if (s_farMeshCur == NULL || s_farMeshCur->mode == -1 || handle == 0 || handle > FAR_MESH_GL_MAX ||
+	    s_farMeshGL[handle - 1].vao == 0 || indexCount <= 0)
+		return;
+	glUniform3fv(s_farMeshCur->base, 1, base);
+	glUniform3fv(s_farMeshCur->eye, 1, eye);
+	glBindVertexArray(s_farMeshGL[handle - 1].vao);
+	glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (const void*)((uintptr_t)firstIndex * sizeof(unsigned)));
+}
+
+/* u_farMode is per-program state: clear it on every program that took it, or
+ * the next legacy split through that shader would run the far branch. */
+extern "C" void GR_FarMeshEnd(void)
+{
+	for (int i = 0; i < 8; i++)
+	{
+		if (s_farMeshLocs[i].prog != 0 && s_farMeshLocs[i].mode != -1)
+		{
+			glUseProgram(s_farMeshLocs[i].prog);
+			glUniform1i(s_farMeshLocs[i].mode, 0);
+		}
+	}
+	glUseProgram(0);
+	g_PreviousShader = (ShaderID)-1;
+	s_farMeshCur = NULL;
+	GR_FarMeshRestoreFrameVao();
+}
+
 void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 {
 	if (num_vertices >= MAX_VERTEX_BUFFER_SIZE)
@@ -8039,9 +8268,6 @@ void GR_DrawTriangles(int start_vertex, int triangles)
 {
 #if USE_OPENGL
 	g_PsyX_DrawCalls++;
-	if (s_gf.draws++ == 0)
-		GreyFrame_FirstDraw();
-	s_gf.tris += triangles;
 	glDrawArrays(GL_TRIANGLES, start_vertex, triangles * 3);
 	/* Per draw, so the failing operation is named rather than inferred from a
 	 * sweep at the end of the scene. Costs a glGetError per draw in a build

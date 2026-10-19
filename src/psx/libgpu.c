@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <SDL_timer.h>
 #include <assert.h>
 #include <ctype.h>
 
@@ -485,11 +486,33 @@ void DrawOTag(u_long* p)
 		 * primitive -- so the cost is per-prim work, not the walk. These two
 		 * numbers say which half owns it. */
 		{
-			extern unsigned g_PsyX_MsParse, g_PsyX_MsSubmit, g_PsyX_OtPrims;
-			unsigned t0 = (unsigned)SDL_GetTicks();
-
+			extern unsigned g_PsyX_MsParse;
+			extern int g_PsxWholeMapProbe;
+			extern double g_wmTParse, g_wmTDraw;
+			extern unsigned g_wmSplits, g_wmVerts, g_wmOtDraws;
+			extern int g_splitIndex, g_vertexIndex;
+			unsigned ms0 = (unsigned)SDL_GetTicks();
+			Uint64 t0 = (g_PsxWholeMapProbe == 1) ? SDL_GetPerformanceCounter() : 0;
 			ParsePrimitivesLinkedList(p, 0);
-			g_PsyX_MsParse += (unsigned)SDL_GetTicks() - t0;
+			g_PsyX_MsParse += (unsigned)SDL_GetTicks() - ms0;
+			if (g_PsxWholeMapProbe == 1)
+			{
+				Uint64 t1 = SDL_GetPerformanceCounter();
+				const double f = 1000.0 / (double)SDL_GetPerformanceFrequency();
+				g_wmTParse += (double)(t1 - t0) * f;
+				g_wmSplits += (unsigned)g_splitIndex;
+				g_wmVerts += (unsigned)g_vertexIndex;
+				g_wmOtDraws++;
+				DrawAllSplits();
+				{
+					extern double g_wmTGpu;
+					const Uint64 t2 = SDL_GetPerformanceCounter();
+					g_wmTDraw += (double)(t2 - t1) * f;
+					glFinish();
+					g_wmTGpu += (double)(SDL_GetPerformanceCounter() - t2) * f;
+				}
+				continue;
+			}
 		}
 
 		/* No glFinish here: the parse is CPU-side and the GL command stream is

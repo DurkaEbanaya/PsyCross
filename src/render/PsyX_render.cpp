@@ -263,6 +263,11 @@ RECT16 g_PreviousOffscreen = { 0,0,0,0 };
 ShaderID g_PreviousShader = -1;
 
 TextureID g_vramTexturesDouble[2];
+/* VRAM textures whose feedback rects are known blank (GR_ClearAllFeedbackRects),
+ * and the rects they were blanked for. */
+static TextureID s_fbBlankTex[2];
+static int       s_fbBlankKey[13];
+static inline void GR_NoteVramTextureWrite(void) { s_fbBlankTex[0] = s_fbBlankTex[1] = 0; }
 TextureID g_vramTexture;
 int g_vramTextureIdx = 0;
 
@@ -2162,9 +2167,43 @@ static void GR_NativeTrack(void)
 	}
 }
 
+/* Viewport and scissor change on every split even when the values do not
+ * (GR_SetOffscreenState re-asserts the display viewport each time), and each
+ * call is a driver round trip. All PsyCross sites go through these; code that
+ * sets either directly must call GR_InvalidateViewScissorCache after. */
+static GLint s_vpCache[4] = { 0, 0, -1, -1 };
+static GLint s_scCache[4] = { 0, 0, -1, -1 };
+/* The decode table on unit 2 is re-asserted once per DrawAllSplits batch
+ * rather than per split; only GR_SetTextureShader binds unit 2. */
+static int s_lutUnitBound = 0;
+
+static void GR_Viewport(GLint x, GLint y, GLint w, GLint h)
+{
+	if (s_vpCache[0] == x && s_vpCache[1] == y && s_vpCache[2] == w && s_vpCache[3] == h)
+		return;
+	s_vpCache[0] = x; s_vpCache[1] = y; s_vpCache[2] = w; s_vpCache[3] = h;
+	glViewport(x, y, w, h);
+}
+
+static void GR_Scissor(GLint x, GLint y, GLint w, GLint h)
+{
+	if (s_scCache[0] == x && s_scCache[1] == y && s_scCache[2] == w && s_scCache[3] == h)
+		return;
+	s_scCache[0] = x; s_scCache[1] = y; s_scCache[2] = w; s_scCache[3] = h;
+	glScissor(x, y, w, h);
+}
+
+void GR_InvalidateViewScissorCache(void)
+{
+	s_vpCache[2] = -1;
+	s_scCache[2] = -1;
+}
+
 void GR_BeginScene()
 {
 	g_lastBoundTexture = 0;
+	GR_InvalidateViewScissorCache();
+	s_lutUnitBound = 0;
 	GR_NativeTrack();
 
 #if USE_OPENGL
@@ -2177,8 +2216,9 @@ void GR_BeginScene()
 	else
 		glClearDepthf(1.0f);
 #endif
-	glClear(GL_DEPTH_BUFFER_BIT);
-	glClear(GL_STENCIL_BUFFER_BIT);
+	/* One clear: a packed depth-stencil buffer clears both together, while a
+	 * stencil-only clear can take a slow read-modify-write path on iGPUs. */
+	glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 #endif
 
 	GR_UpdateVRAM();
@@ -2265,6 +2305,7 @@ GTEShader g_gte_shader_4;
 GTEShader g_gte_shader_8;
 GTEShader g_gte_shader_16;
 GTEShader g_gte_shader_32_rgba;
+GTEShader g_gte_shader_mix;
 GTEShader g_modern_shader_4, g_modern_shader_8, g_modern_shader_16, g_modern_shader_32_rgba;
 
 #if USE_OPENGL
@@ -2452,8 +2493,12 @@ int g_PsxFogToBlack = 0;
 #endif
 
 #define GPU_SAMPLE_TEXTURE_4BIT_FUNC\
-    "   // returns the two VRAM bytes (lut index)\n"\
     "   vec2 samplePSX(vec2 tc){\n"\
+    GPU_SAMPLE_4BIT_BODY\
+    "   }\n"
+
+#define GPU_SAMPLE_4BIT_BODY\
+    "   // returns the two VRAM bytes (lut index)\n"\
     "       vec2 uv = (tc * vec2(0.25, 1.0) + v_page_clut.xy) * c_VRAMTexel;\n"\
     "       vec2 comp = VRAM(uv);\n"\
     "       int index = int(fract(tc.x / 4.0 + 0.0001) * 4.0);\n"\
@@ -2462,24 +2507,48 @@ int g_PsxFogToBlack = 0;
     "       vec2 c = vec2( (v - f) * 16.0, f );\n"\
     "       vec2 clut_pos = v_page_clut.zw;\n"\
     "       clut_pos.x += mix(c[0], c[1], mod(float(index), 2.0)) * c_VRAMTexel.x;\n"\
-    "       return VRAM(clut_pos);\n"\
-    "   }\n"
+    "       return VRAM(clut_pos);\n"
 
 #define GPU_SAMPLE_TEXTURE_8BIT_FUNC\
-	"	// returns the two VRAM bytes (lut index)\n"\
 	"	vec2 samplePSX(vec2 tc){\n"\
+	GPU_SAMPLE_8BIT_BODY\
+	"	}\n"
+
+#define GPU_SAMPLE_8BIT_BODY\
+	"	// returns the two VRAM bytes (lut index)\n"\
 	"		vec2 uv = (tc * vec2(0.5, 1.0) + v_page_clut.xy) * c_VRAMTexel;\n"\
 	"		vec2 comp = VRAM(uv);\n"\
 	"		vec2 clut_pos = v_page_clut.zw;\n"\
 	"		int index = int(mod(tc.x, 2.0));\n"\
 	"		clut_pos.x += _idx2(comp, index) * 255.0 * c_VRAMTexel.x;\n"\
-	"		return VRAM(clut_pos);\n"\
-	"	}\n"
+	"		return VRAM(clut_pos);\n"
 
 #define GPU_SAMPLE_TEXTURE_16BIT_FUNC\
 	"	vec2 samplePSX(vec2 tc){\n"\
+	GPU_SAMPLE_16BIT_BODY\
+	"	}\n"
+
+#define GPU_SAMPLE_16BIT_BODY\
 	"		vec2 uv = (tc + v_page_clut.xy) * c_VRAMTexel;\n"\
-	"		return VRAM(uv);\n"\
+	"		return VRAM(uv);\n"
+
+/* One program for every VRAM format: the tpage format rides in each vertex
+ * (v_texfmt), so a format change in OT order no longer ends the batch. It is
+ * constant across a prim, so the branch is coherent. */
+#define GPU_SAMPLE_TEXTURE_MIX_FUNC\
+	"	vec2 samplePSX4(vec2 tc){\n"\
+	GPU_SAMPLE_4BIT_BODY\
+	"	}\n"\
+	"	vec2 samplePSX8(vec2 tc){\n"\
+	GPU_SAMPLE_8BIT_BODY\
+	"	}\n"\
+	"	vec2 samplePSX16(vec2 tc){\n"\
+	GPU_SAMPLE_16BIT_BODY\
+	"	}\n"\
+	"	vec2 samplePSX(vec2 tc){\n"\
+	"		if (v_texfmt < 0.5) return samplePSX4(tc);\n"\
+	"		if (v_texfmt < 1.5) return samplePSX8(tc);\n"\
+	"		return samplePSX16(tc);\n"\
 	"	}\n"
 
 
@@ -2642,9 +2711,10 @@ int g_PsxFogToBlack = 0;
 		 * exactly what the flat path yields for the same vz. World never
 		 * depth-tests itself (ALWAYS painter), so this only makes the depth
 		 * field actors LEQUAL against per-pixel accurate — closing the
-		 * distant grazing gaps flat-average depth leaves. */\
+		 * distant grazing gaps flat-average depth leaves. a_extra.w == 2
+		 * marks ACTOR verts: the same depth, minus the world's far-push. */\
 		"		if (a_extra.w > 0.5) {\n"\
-		"			float dvz = min(a_pgxp.z + u_worldFarBias, u_szMax);\n"\
+		"			float dvz = min(a_pgxp.z + (a_extra.w > 1.5 ? 0.0 : u_worldFarBias), u_szMax);\n"\
 		"			b.z = (2.0 * dvz / u_szMax - 1.0) * b.w;\n"\
 		"		}\n"\
 		"		gl_Position = vec4(b.xyz * W, b.w * W);\n"\
@@ -2686,8 +2756,12 @@ int g_PsxFogToBlack = 0;
 	"		v_texcoord.xy += a_extra.xy * 0.5;\n"\
 	"		v_color = a_color;\n"\
 	"		v_color.xyz *= a_texcoord.z;\n"\
-	"		v_page_clut.x = fract(a_position.z / 16.0) * 1024.0;\n"\
-	"		v_page_clut.y = floor(a_position.z / 16.0) * 256.0;\n"\
+	/* Vertex page = tpage X/Y in bits 0-4, tpage format in bits 5-6, and bit 7
+	 * marks an untextured prim (MakeTexcoord*): v_texfmt 4 = untextured. */\
+	"		float pageXY = mod(a_position.z, 32.0);\n"\
+	"		v_texfmt = floor(a_position.z / 32.0);\n"\
+	"		v_page_clut.x = fract(pageXY / 16.0) * 1024.0;\n"\
+	"		v_page_clut.y = floor(pageXY / 16.0) * 256.0;\n"\
 	"		v_page_clut.z = fract(a_position.w / 64.0);\n"\
 	"		v_page_clut.w = floor(a_position.w / 64.0) / 512.0;\n"\
 	"		v_page_clut.xy += c_UVFudge;\n"\
@@ -2760,12 +2834,17 @@ int g_PsxFogToBlack = 0;
  * whose textures (virtual pool slots, hi-res/pack replacements) cover the
  * same world surfaces as the VRAM samplers. */
 #define GPU_LIT_UNIFORMS\
+	"	uniform int u_untextured;\n"\
+	GPU_LIT_UNIFORMS_COMMON
+
+/* The merged program reads untextured per vertex, so there it is a global set
+ * at the top of main() instead of a uniform. */
+#define GPU_LIT_UNIFORMS_COMMON\
 	"	uniform vec3 u_fogColor;\n"\
 	"	uniform int u_fogToBlack;\n"\
 	"	uniform float u_fogStrength;\n"\
 	"	uniform int u_voidProbe;\n"\
 	"	uniform int u_flashlightOn;\n"\
-	"	uniform int u_untextured;\n"\
 	"	uniform int u_flStyle;\n"\
 	"	uniform vec3 u_flLightPos;\n"\
 	"	uniform vec3 u_flDir;\n"\
@@ -2910,22 +2989,45 @@ int g_PsxFogToBlack = 0;
 	 * anything still at its real colour is proven to come from outside this tail. */\
 	"		if (u_voidProbe > 0) fragColor = vec4(fogAmt, v_is3d, 200.0 / 255.0, 1.0);\n"
 
-#define GPU_FRAGMENT_SAMPLE_SHADER(bit) \
+#define GPU_FRAGMENT_HEAD(sampleFunc, litUniforms) \
 	GPU_PACK_RG_FUNC\
 	GPU_DECODE_RG_FUNC\
 	GPU_FETCH_VRAM_FUNC\
 	"	const vec2 c_VRAMTexel = vec2(1.0 / 1024.0, 1.0 / 512.0);\n"\
 	GPU_ARRAY_FUNC\
-	GPU_SAMPLE_TEXTURE_## bit ##BIT_FUNC\
+	sampleFunc\
 	GPU_BILINEAR_SAMPLE_FUNC\
 	GPU_NEAREST_SAMPLE_FUNC\
 	"	uniform int bilinearFilter;\n"\
 	"	uniform float u_ditherForce;\n"\
 	"	uniform float u_pixelScale;\n"\
-	GPU_LIT_UNIFORMS\
+	litUniforms
+
+#define GPU_FRAGMENT_SAMPLE_SHADER(bit) \
+	GPU_FRAGMENT_HEAD(GPU_SAMPLE_TEXTURE_## bit ##BIT_FUNC, GPU_LIT_UNIFORMS)\
 	"	void main() {\n"\
 	"		g_tapCov = 1.0;\n"\
 	"		g_tapWt = 1.0;\n"\
+	GPU_FRAGMENT_FILTERED_SAMPLE\
+	GPU_FRAGMENT_TAIL
+
+/* Untextured prims used to sample the 1x1 white placeholder (0xFFFF), which
+ * every format decodes to lut(1,1) at full coverage, so that value is used
+ * here without a fetch. */
+#define GPU_FRAGMENT_MIX_SHADER \
+	GPU_FRAGMENT_HEAD(GPU_SAMPLE_TEXTURE_MIX_FUNC, "	int u_untextured;\n" GPU_LIT_UNIFORMS_COMMON)\
+	"	void main() {\n"\
+	"		g_tapCov = 1.0;\n"\
+	"		g_tapWt = 1.0;\n"\
+	"		u_untextured = (v_texfmt > 3.5) ? 1 : 0;\n"\
+	"		if (u_untextured > 0)\n"\
+	"			fragColor = lut(vec2(1.0));\n"\
+	"		else {\n"\
+	GPU_FRAGMENT_FILTERED_SAMPLE\
+	"		}\n"\
+	GPU_FRAGMENT_TAIL
+
+#define GPU_FRAGMENT_FILTERED_SAMPLE \
 	/* bilinearFilter is the GATE (0 = off, 1 = 3D geometry only, 2 = this whole
 	 * frame); u_anisoTaps chooses HOW to filter once it passes. Keeping the two
 	 * separate is why anisotropic needs no new gate logic. */\
@@ -2933,7 +3035,9 @@ int g_PsxFogToBlack = 0;
 	"			fragColor = (u_anisoTaps > 1.0) ? AnisoTextureSample(v_texcoord.xy)\n"\
 	"			                                : BilinearTextureSample(v_texcoord.xy);\n"\
 	"		else\n"\
-	"			fragColor = NearestTextureSample(v_texcoord.xy);\n"\
+	"			fragColor = NearestTextureSample(v_texcoord.xy);\n"
+
+#define GPU_FRAGMENT_TAIL \
 	/* Untextured prims bind a 1x1 white placeholder, which decodes through the
 	 * 5-bit table like any VRAM texel: 0xFFFF -> 248/256, so every flat or
 	 * gouraud prim drew at 31/32 of its vertex colour. PSX draws them at the
@@ -2973,6 +3077,7 @@ const char* gte_shader_4 =
 	"varying float v_geom3d;\n"
 	"AFFINE_VARYING vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
+	"varying float v_texfmt;\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
 	"#else\n"
@@ -2991,6 +3096,7 @@ const char* gte_shader_8 =
 	"varying float v_geom3d;\n"
 	"AFFINE_VARYING vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
+	"varying float v_texfmt;\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
 	"#else\n"
@@ -3009,10 +3115,30 @@ const char* gte_shader_16 =
 	"varying float v_geom3d;\n"
 	"AFFINE_VARYING vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
+	"varying float v_texfmt;\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
 	"#else\n"
 	GPU_FRAGMENT_SAMPLE_SHADER(16)
+	"#endif\n";
+
+const char* gte_shader_mix =
+	"AFFINE_VARYING vec4 v_texcoord;\n"
+	"varying vec4 v_color;\n"
+	"AFFINE_VARYING vec4 v_page_clut;\n"
+	"varying float v_z;\n"
+	"varying float v_fogAmount;\n"
+	"varying float v_is3d;\n"
+	"varying vec3 v_viewpos;\n"
+	"varying float v_fade;\n"
+	"varying float v_geom3d;\n"
+	"AFFINE_VARYING vec4 v_uvlim;\n"
+	"varying vec4 v_shadowViewPos;\n"
+	"varying float v_texfmt;\n"
+	"#ifdef VERTEX\n"
+	GTE_VERTEX_SHADER
+	"#else\n"
+	GPU_FRAGMENT_MIX_SHADER
 	"#endif\n";
 
 const char* gte_shader_32_rgba =
@@ -3027,6 +3153,7 @@ const char* gte_shader_32_rgba =
 	"varying float v_geom3d;\n"
 	"AFFINE_VARYING vec4 v_uvlim;\n"
 	"varying vec4 v_shadowViewPos;\n"
+	"varying float v_texfmt;\n"
 	"#ifdef VERTEX\n"
 	GTE_VERTEX_SHADER
 	"#else\n"
@@ -3643,6 +3770,18 @@ void GR_InitialisePSXShaders()
 	GR_CompilePSXShader(&g_gte_shader_8, gte_shader_8);
 	GR_CompilePSXShader(&g_gte_shader_16, gte_shader_16);
 	GR_CompilePSXShader(&g_gte_shader_32_rgba, gte_shader_32_rgba);
+	GR_CompilePSXShader(&g_gte_shader_mix, gte_shader_mix);
+	{
+		extern int g_PsxMixedShaderOk;
+		GLint linked = GL_FALSE;
+
+		glGetProgramiv(g_gte_shader_mix.shader, GL_LINK_STATUS, &linked);
+		g_PsxMixedShaderOk = (linked == GL_TRUE) ? 1 : 0;
+		if (!g_PsxMixedShaderOk)
+		{
+			eprinterr("all-format shader failed to build; using per-format shaders\n");
+		}
+	}
 	Pc_ModernShader_Initialise(gte_shader_4, gte_shader_8, gte_shader_16, gte_shader_32_rgba);
 	GR_InitialisePSXShader(&g_modern_shader_4, Pc_ModernShader_Get(TF_4_BIT));
 	GR_InitialisePSXShader(&g_modern_shader_8, Pc_ModernShader_Get(TF_8_BIT));
@@ -3772,6 +3911,7 @@ int GR_InitialisePSX()
 		glGenFramebuffers(1, &g_glVRAMFramebuffer);
 		{
 			glBindFramebuffer(GL_FRAMEBUFFER, g_glVRAMFramebuffer);
+			GR_NoteVramTextureWrite();
 
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_vramTexture, 0);
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
@@ -3926,7 +4066,7 @@ void GR_SetupClipMode(const RECT16* rect, int enable)
 	const float crh = clipRectH * (float)g_windowHeight;
 
 	{ extern unsigned g_PsyX_ScissorSet; g_PsyX_ScissorSet++; }
-	glScissor(crx, flipOffset - cry, crw, crh);
+	GR_Scissor((GLint)crx, (GLint)(flipOffset - cry), (GLint)crw, (GLint)crh);
 #endif
 }
 
@@ -4283,9 +4423,13 @@ static void GR_SetTextureShader(TextureID texture, TexFormat texFormat, GTEShade
 	 * leaves another texture on that unit would otherwise decode every texel
 	 * through it. Cheap next to the uniform pushes below, and it restores
 	 * unit 0 so nothing downstream inherits a stray active unit. */
-	glActiveTexture(GL_TEXTURE2);
-	glBindTexture(GL_TEXTURE_2D, g_rgLutTexture);
-	glActiveTexture(GL_TEXTURE0);
+	if (!s_lutUnitBound)
+	{
+		glActiveTexture(GL_TEXTURE2);
+		glBindTexture(GL_TEXTURE_2D, g_rgLutTexture);
+		glActiveTexture(GL_TEXTURE0);
+		s_lutUnitBound = 1;
+	}
 
 	/* Push the dither-force uniform every shader bind. Cheap (single
 	 * float upload) and ensures runtime config changes (if we add a
@@ -4398,6 +4542,11 @@ void GR_SetTexture(TextureID texture, TexFormat texFormat)
 	else if (texFormat == TF_16_BIT) shader = &g_gte_shader_16;
 	else shader = &g_gte_shader_32_rgba;
 	GR_SetTextureShader(texture, texFormat, shader);
+}
+
+void GR_SetTextureMixed(TextureID texture)
+{
+	GR_SetTextureShader(texture, TF_16_BIT, &g_gte_shader_mix);
 }
 
 void GR_SetOverrideTextureSize(int width, int height, int offsetX, int offsetY,
@@ -4605,7 +4754,7 @@ void GR_Clear(int x, int y, int w, int h, unsigned char r, unsigned char g, unsi
 			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
 			glEnable(GL_SCISSOR_TEST);
-			glScissor(vpX, 0, vpW, g_windowHeight);
+			GR_Scissor(vpX, 0, vpW, g_windowHeight);
 			glClearColor(r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
 			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 			glDisable(GL_SCISSOR_TEST);
@@ -4720,6 +4869,7 @@ static void GR_UploadVramRect(int x, int y, int w, int h)
 	{
 		glBindTexture(GL_TEXTURE_2D, g_vramTexturesDouble[t]);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, VRAM_FORMAT, GL_UNSIGNED_BYTE, s_packed);
+		GR_NoteVramTextureWrite();
 	}
 	glBindTexture(GL_TEXTURE_2D, g_lastBoundTexture);
 #endif
@@ -5435,6 +5585,7 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 		// before drawing set source and target
 		{
 			glBindFramebuffer(GL_FRAMEBUFFER, g_glVRAMFramebuffer);
+			GR_NoteVramTextureWrite();
 
 			// rebind texture
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_vramTexture, 0);
@@ -5442,6 +5593,7 @@ void GR_SetOffscreenState(const RECT16* offscreenRect, int enable)
 			// setup draw and read framebuffers
 			glBindFramebuffer(GL_READ_FRAMEBUFFER, g_glOffscreenFramebuffer);					// source is backbuffer
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glVRAMFramebuffer);
+			GR_NoteVramTextureWrite();
 
 			glBlitFramebuffer(0, 0, g_PreviousOffscreen.w, g_PreviousOffscreen.h,
 								g_PreviousOffscreen.x, g_PreviousOffscreen.y + g_PreviousOffscreen.h, g_PreviousOffscreen.x + g_PreviousOffscreen.w, g_PreviousOffscreen.y,
@@ -5732,7 +5884,7 @@ static void GR_EnsurePostTarget(int w, int h)
 static void GR_DrawFullscreenTexture(TextureID tex, int mode)
 {
 	glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
-	glViewport(0, 0, g_windowWidth, g_windowHeight);
+	GR_Viewport(0, 0, g_windowWidth, g_windowHeight);
 
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_BLEND);
@@ -6091,7 +6243,7 @@ void GR_ShadowPassBegin(void)
 	glGetIntegerv(GL_VIEWPORT, s_shadowPrevViewport);
 
 	glBindFramebuffer(GL_FRAMEBUFFER, g_shadowFBO);
-	glViewport(0, 0, PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE);
+	GR_Viewport(0, 0, PSYX_SHADOW_MAP_SIZE, PSYX_SHADOW_MAP_SIZE);
 
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_STENCIL_TEST);
@@ -6118,7 +6270,7 @@ void GR_ShadowPassEnd(void)
 {
 	glDisable(GL_POLYGON_OFFSET_FILL);
 	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)s_shadowPrevFBO);
-	glViewport(s_shadowPrevViewport[0], s_shadowPrevViewport[1],
+	GR_Viewport(s_shadowPrevViewport[0], s_shadowPrevViewport[1],
 	           s_shadowPrevViewport[2], s_shadowPrevViewport[3]);
 	glDepthFunc(GL_LEQUAL);  /* restore the renderer default; the pass set GL_LESS */
 
@@ -6215,10 +6367,14 @@ void GR_CaptureLastFrame(void)
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		glBindTexture(GL_TEXTURE_2D, 0);
 		g_freezeFrameValid = 0;
+
+		/* Attached only when the storage changes: re-attaching every frame
+		 * made the driver revalidate the FBO on each capture. */
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_freezeFrameFBO);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_freezeFrameTex, 0);
 	}
 
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_freezeFrameFBO);
-	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_freezeFrameTex, 0);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, GR_ScreenReadFBO());
 
 	/* Clear the error state FIRST. This frame already carries a recurring
@@ -6654,8 +6810,9 @@ static void GR_PackFrameToVramRectGain(int x, int y, int w, int h, float gain)
 	glGetIntegerv(GL_VIEWPORT, vp);
 
 	glBindFramebuffer(GL_FRAMEBUFFER, g_glVRAMFramebuffer);
+	GR_NoteVramTextureWrite();
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_vramTexture, 0);
-	glViewport(x, y, w, h);
+	GR_Viewport(x, y, w, h);
 
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_BLEND);
@@ -6686,7 +6843,7 @@ static void GR_PackFrameToVramRectGain(int x, int y, int w, int h, float gain)
 
 	glEnable(GL_STENCIL_TEST);
 	glBindFramebuffer(GL_FRAMEBUFFER, GR_ScreenFBO());
-	glViewport(vp[0], vp[1], vp[2], vp[3]);
+	GR_Viewport(vp[0], vp[1], vp[2], vp[3]);
 
 	/* Sentinels, not the real state — see GR_DrawFullscreenTexture: recording the
 	 * truth lets GR_SetBlendMode early-return and strand depth off. */
@@ -6747,7 +6904,7 @@ static void GR_ClearVramRect(int x, int y, int w, int h)
 	glDisable(GL_DEPTH_TEST);
 	glDisable(GL_BLEND);
 	glEnable(GL_SCISSOR_TEST);
-	glScissor(x, y, w, h);
+	GR_Scissor(x, y, w, h);
 	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 	glDisable(GL_SCISSOR_TEST);
@@ -6784,11 +6941,38 @@ static void GR_ClearAllFeedbackRects(void)
 	if (!g_psxDispBufValid)
 		return;
 
+	/* Runs every present while the feedback store is off, but the rects stay
+	 * blank until something writes VRAM again (GR_NoteVramTextureWrite), so
+	 * repeat the 2-3 framebuffer switches only after a write, a texture swap,
+	 * or a change of rects. */
+	{
+		const int redirect = (g_sceneFbRedirectTtl > 0);
+		const int key[13] = {
+			g_psxDispBuf[0].x, g_psxDispBuf[0].y, g_psxDispBuf[0].w, g_psxDispBuf[0].h,
+			g_psxDispBuf[1].x, g_psxDispBuf[1].y, g_psxDispBuf[1].w, g_psxDispBuf[1].h,
+			redirect,
+			redirect ? g_sceneFbRedirect.x : 0, redirect ? g_sceneFbRedirect.y : 0,
+			redirect ? g_sceneFbRedirect.w : 0, redirect ? g_sceneFbRedirect.h : 0 };
+
+		if (memcmp(key, s_fbBlankKey, sizeof(key)) != 0)
+		{
+			memcpy(s_fbBlankKey, key, sizeof(key));
+			s_fbBlankTex[0] = s_fbBlankTex[1] = 0;
+		}
+		if (g_vramTexture != 0 && (s_fbBlankTex[0] == g_vramTexture || s_fbBlankTex[1] == g_vramTexture))
+			return;
+	}
+
 	GR_ClearVramRect(g_psxDispBuf[0].x, g_psxDispBuf[0].y, g_psxDispBuf[0].w, g_psxDispBuf[0].h);
 	GR_ClearVramRect(g_psxDispBuf[1].x, g_psxDispBuf[1].y, g_psxDispBuf[1].w, g_psxDispBuf[1].h);
 
 	if (g_sceneFbRedirectTtl > 0)
 		GR_ClearVramRect(g_sceneFbRedirect.x, g_sceneFbRedirect.y, g_sceneFbRedirect.w, g_sceneFbRedirect.h);
+
+	if (s_fbBlankTex[0] == 0)
+		s_fbBlankTex[0] = g_vramTexture;
+	else
+		s_fbBlankTex[1] = g_vramTexture;
 }
 
 /* Capture the frame as rendered so far into the (w x h) pack texture, mapped so
@@ -7180,6 +7364,7 @@ void GR_StoreFrameBuffer(int x, int y, int w, int h)
 
 		// before drawing set source and target
 		glBindFramebuffer(GL_FRAMEBUFFER, g_glVRAMFramebuffer);
+		GR_NoteVramTextureWrite();
 
 		// rebind vram texture
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_vramTexture, 0);
@@ -7187,6 +7372,7 @@ void GR_StoreFrameBuffer(int x, int y, int w, int h)
 		// setup draw and read framebuffers
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, g_glBlitFramebuffer);					// source is backbuffer
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glVRAMFramebuffer);
+		GR_NoteVramTextureWrite();
 
 		glBlitFramebuffer(0, 0, w, h,
 			x, y + h, x + w, y,
@@ -7257,10 +7443,12 @@ static void GR_RestoreStoredFramebufferRegion(void)
 		return;
 
 	glBindFramebuffer(GL_FRAMEBUFFER, g_glVRAMFramebuffer);
+	GR_NoteVramTextureWrite();
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_vramTexture, 0);
 
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, g_glBlitFramebuffer);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_glVRAMFramebuffer);
+	GR_NoteVramTextureWrite();
 
 	glBlitFramebuffer(0, 0, w, h,
 		x, y + h, x + w, y,
@@ -7367,6 +7555,7 @@ void GR_UpdateVRAM()
 	glTexImage2D(GL_TEXTURE_2D, 0, VRAM_INTERNAL_FORMAT, VRAM_WIDTH, VRAM_HEIGHT, 0, VRAM_FORMAT, GL_UNSIGNED_BYTE, vram);
 #else
 	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VRAM_WIDTH, VRAM_HEIGHT, VRAM_FORMAT, GL_UNSIGNED_BYTE, vram);
+	GR_NoteVramTextureWrite();
 #endif
 
 
@@ -7419,6 +7608,7 @@ void GR_DirectUploadVRAMRegion(int x, int y, int w, int h)
 	{
 		glBindTexture(GL_TEXTURE_2D, g_vramTexturesDouble[i]);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, VRAM_FORMAT, GL_UNSIGNED_BYTE, block);
+		GR_NoteVramTextureWrite();
 	}
 	glBindTexture(GL_TEXTURE_2D, g_lastBoundTexture);
 
@@ -7523,7 +7713,7 @@ void GR_SwapWindow()
 
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, PSYX_DEFAULT_FBO);
-		glViewport(0, 0, g_presentWidth, g_presentHeight);
+		GR_Viewport(0, 0, g_presentWidth, g_presentHeight);
 
 		/* Scissor would clip both the clear and the blit to whatever the frame
 		 * last set, so it is off for the present. */
@@ -7545,11 +7735,11 @@ void GR_SwapWindow()
 		if (g_PcNativeRender && g_PsyX_PostCaptureHook)
 		{
 			glBindFramebuffer(GL_FRAMEBUFFER, 0);
-			glViewport(dx, dy, dw, dh);
+			GR_Viewport(dx, dy, dw, dh);
 			s_overlayToWindow = 1;
 			g_PsyX_PostCaptureHook();
 			s_overlayToWindow = 0;
-			glViewport(0, 0, g_presentWidth, g_presentHeight);
+			GR_Viewport(0, 0, g_presentWidth, g_presentHeight);
 		}
 		if (g_PsxVoidProbeArmed)
 		{
@@ -7870,7 +8060,7 @@ void GR_SetPolygonOffset(float ofs)
 void GR_SetViewPort(int x, int y, int width, int height)
 {
 #if USE_OPENGL
-	glViewport(x, y, width, height);
+	GR_Viewport(x, y, width, height);
 #endif
 }
 
@@ -8158,6 +8348,7 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 
 	//assert(num_vertices <= MAX_VERTEX_BUFFER_SIZE);
 	GR_BindVertexBuffer();
+	s_lutUnitBound = 0;
 
 #if USE_OPENGL
 	/* ORPHAN the buffer before writing it.

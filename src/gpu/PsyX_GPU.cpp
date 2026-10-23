@@ -994,7 +994,18 @@ int g_DrawPrimMode = 0;
  * static faces — rugs on floors, paper on desks, distant road/wall panels — stop
  * z-fighting, while still leaving a real depth buffer for actors to LEQUAL-test
  * against. All of it is gated on g_PsxUsePgxp; with PGXP off nothing reads kind. */
-enum { SZ_KIND_NONE = 0, SZ_KIND_FLAT = 1, SZ_KIND_EXACT = 2 };
+enum { SZ_KIND_NONE = 0, SZ_KIND_FLAT = 1, SZ_KIND_EXACT = 2, SZ_KIND_ACTOR = 3 };
+/* ACTOR: a character prim armed with its own per-vertex SZ by the game's
+ * skeleton drawers (PsyX_SetNextPrimSzActor while g_PsxActorDepth is set).
+ * Unarmed, those drawers reach the capture with the GTE FIFO's SZ, which the
+ * lighting steps have clobbered: with PGXP off each prim took a stale flat
+ * depth, and with it on the flat bucket seed tied every prim of a bucket. Either
+ * way overlapping surfaces (Harry's belt under the jacket hem, a high-poly
+ * model's mouth behind its lips) flickered as the pose moved. Armed prims take
+ * per-vertex depth instead -- from the PGXP W when it exists (shader,
+ * a_extra.w == 2, without the world's far-push so they still win against the
+ * floor they stand on), else from the SZ. */
+extern "C" { int g_PsxActorDepth = 0; int g_PsxPgxpActorDepth = 1; }
 /* WORLD_FAR: whole-map far-band world geometry. Every poly past the last OT
  * bucket shares that one bucket, so painter order cannot sort the distant town
  * (blocks and trees composite in submission order); those prims draw GL_LEQUAL
@@ -1175,6 +1186,18 @@ extern "C" float PsyX_GetItemDepthSzMax(void)
 extern "C" void PsyX_NoteItemDepthSz(unsigned int sz)
 {
 	if (sz > g_szMaxThisFrame) g_szMaxThisFrame = sz;
+}
+
+/* Corners in prim order; a triangle passes n = 3 (the parse reads a triangle's
+ * corners from slots 1..3, the FIFO's SZ1..SZ3). */
+extern "C" void PsyX_SetNextPrimSzActor(unsigned short s0, unsigned short s1, unsigned short s2, unsigned short s3, int n)
+{
+	if (n == 3) { s3 = s2; s2 = s1; s1 = s0; }
+	g_primSzNext[0] = s0; g_primSzNext[1] = s1;
+	g_primSzNext[2] = s2; g_primSzNext[3] = s3;
+	g_primSzNextValid = 1;
+	g_primSzNextKind = SZ_KIND_ACTOR;
+	g_primSzNextFar = 0;
 }
 
 extern "C" void PsyX_SetNextPrimSzExact(unsigned short s0, unsigned short s1, unsigned short s2, unsigned short s3)
@@ -1458,6 +1481,7 @@ static void ApplyGtePerVertexDepthImpl(GrVertex* vertex, const P_TAG* polyTag, b
 	 * it (s_primAlphaPending) and reset it to 255. */
 	s_primAlphaPending = (g_PsxPgxpDbg & 4) ? 255 : PsyX_LookupGteAlpha(polyTag);
 
+
 	float sv0, sv1, sv2, sv3 = 0.0f;
 	if (isQuad) {
 		sv0 = (float)sz[0]; sv1 = (float)sz[1];
@@ -1469,6 +1493,29 @@ static void ApplyGtePerVertexDepthImpl(GrVertex* vertex, const P_TAG* polyTag, b
 	float sz_avg = isQuad ? (sv0 + sv1 + sv2 + sv3) * 0.25f
 	                      : (sv0 + sv1 + sv2) * (1.0f / 3.0f);
 	if (sz_avg < 1.0f) return;  // 2D/HUD prim — keep bucket depth
+
+	if (kind == SZ_KIND_ACTOR && g_PsxPgxpActorDepth && !g_PsyX_ForceItemDepth)
+	{
+		const float sv[4] = { sv0, sv1, sv2, sv3 };
+		const int n = isQuad ? 4 : 3;
+		for (int i = 0; i < n; i++)
+		{
+			float z;
+			if (pgxpWorldPath)
+			{
+				z = PgxpNdcFromViewZ(sv[i]);
+				vertex[i]._p1 = 2;
+			}
+			else
+			{
+				z = 1.0f - 2.0f * sv[i] / (float)g_szMaxPrevFrame;
+				if (z < -1.0f) z = -1.0f;
+				if (z >  1.0f) z =  1.0f;
+			}
+			vertex[i].z = z;
+		}
+		return;
+	}
 
 	/* Item pass (g_PsyX_ForceItemDepth): TRUE per-vertex depth. A flat
 	 * per-poly average cannot order a large foreshortened face against
@@ -1953,6 +2000,7 @@ struct GPUDrawSplit
 	int				overrideHiresH;
 
 	int				isGlyph; /* see g_PsyX_TextGlyphTest */
+	int				mixed;   /* drawn with the all-format program (g_gte_shader_mix) */
 
 	const char*		debugText;
 };
@@ -2424,6 +2472,16 @@ static inline void SetUvLimits(GrVertex* vertex, int count)
 	}
 }
 
+/* Vertex page: tpage X/Y (bits 0-4) plus the tpage format (bits 7-8) moved to
+ * bits 5-6, so the all-format program can pick its sampler per vertex. The
+ * per-format programs only read bits 0-4. Untextured prims use
+ * TEXCOORD_PAGE_UNTEXTURED. */
+#define TEXCOORD_PAGE_UNTEXTURED 0x80
+static inline short TexcoordPage(int tpage)
+{
+	return (short)((tpage & 0x1F) | (((tpage >> 7) & 0x3) << 5));
+}
+
 void MakeTexcoordQuad(GrVertex* vertex, unsigned char* uv0, unsigned char* uv1, unsigned char* uv2, unsigned char* uv3, short page, short clut, unsigned char dither)
 {
 	assert(uv0);
@@ -2432,8 +2490,7 @@ void MakeTexcoordQuad(GrVertex* vertex, unsigned char* uv0, unsigned char* uv1, 
 	assert(uv3);
 
 	const unsigned char bright = 2;
-	// Strip ABR (bits 5-6) and TP (bits 7-8) from tpage - shader only needs X/Y page coords (bits 0-4)
-	short pageCoord = page & 0x1F;
+	short pageCoord = TexcoordPage(page);
 
 	vertex[0].u = uv0[0];
 	vertex[0].v = uv0[1];
@@ -2488,8 +2545,7 @@ void MakeTexcoordTriangle(GrVertex* vertex, unsigned char* uv0, unsigned char* u
 	assert(uv2);
 
 	const unsigned char bright = 2;
-	// Strip ABR (bits 5-6) and TP (bits 7-8) from tpage - shader only needs X/Y page coords (bits 0-4)
-	short pageCoord = page & 0x1F;
+	short pageCoord = TexcoordPage(page);
 
 	vertex[0].u = uv0[0];
 	vertex[0].v = uv0[1];
@@ -2559,8 +2615,7 @@ void MakeTexcoordRect(GrVertex* vertex, unsigned char* uv, short page, short clu
 
 	const unsigned char bright = 2;
 	const unsigned char dither = 0;
-	// Strip ABR (bits 5-6) and TP (bits 7-8) from tpage - shader only needs X/Y page coords (bits 0-4)
-	short pageCoord = page & 0x1F;
+	short pageCoord = TexcoordPage(page);
 
 	vertex[0].u = uv[0];
 	vertex[0].v = uv[1];
@@ -2643,28 +2698,28 @@ void MakeTexcoordLineZero(GrVertex* vertex, unsigned char dither)
 	vertex[0].v = 0;
 	vertex[0].bright = bright;
 	vertex[0].dither = dither;
-	vertex[0].page = 0;
+	vertex[0].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[0].clut = 0;
 
 	vertex[1].u = 0;
 	vertex[1].v = 0;
 	vertex[1].bright = bright;
 	vertex[1].dither = dither;
-	vertex[1].page = 0;
+	vertex[1].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[1].clut = 0;
 
 	vertex[2].u = 0;
 	vertex[2].v = 0;
 	vertex[2].bright = bright;
 	vertex[2].dither = dither;
-	vertex[2].page = 0;
+	vertex[2].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[2].clut = 0;
 
 	vertex[3].u = 0;
 	vertex[3].v = 0;
 	vertex[3].bright = bright;
 	vertex[3].dither = dither;
-	vertex[3].page = 0;
+	vertex[3].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[3].clut = 0;
 }
 
@@ -2676,21 +2731,21 @@ void MakeTexcoordTriangleZero(GrVertex* vertex, unsigned char dither)
 	vertex[0].v = 0;
 	vertex[0].bright = bright;
 	vertex[0].dither = dither;
-	vertex[0].page = 0;
+	vertex[0].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[0].clut = 0;
 
 	vertex[1].u = 0;
 	vertex[1].v = 0;
 	vertex[1].bright = bright;
 	vertex[1].dither = dither;
-	vertex[1].page = 0;
+	vertex[1].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[1].clut = 0;
 
 	vertex[2].u = 0;
 	vertex[2].v = 0;
 	vertex[2].bright = bright;
 	vertex[2].dither = dither;
-	vertex[2].page = 0;
+	vertex[2].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[2].clut = 0;
 }
 
@@ -2702,28 +2757,28 @@ void MakeTexcoordQuadZero(GrVertex* vertex, unsigned char dither)
 	vertex[0].v = 0;
 	vertex[0].bright = bright;
 	vertex[0].dither = dither;
-	vertex[0].page = 0;
+	vertex[0].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[0].clut = 0;
 
 	vertex[1].u = 0;
 	vertex[1].v = 0;
 	vertex[1].bright = bright;
 	vertex[1].dither = dither;
-	vertex[1].page = 0;
+	vertex[1].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[1].clut = 0;
 
 	vertex[2].u = 0;
 	vertex[2].v = 0;
 	vertex[2].bright = bright;
 	vertex[2].dither = dither;
-	vertex[2].page = 0;
+	vertex[2].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[2].clut = 0;
 
 	vertex[3].u = 0;
 	vertex[3].v = 0;
 	vertex[3].bright = bright;
 	vertex[3].dither = dither;
-	vertex[3].page = 0;
+	vertex[3].page = TEXCOORD_PAGE_UNTEXTURED;
 	vertex[3].clut = 0;
 }
 
@@ -3121,6 +3176,9 @@ static int PgxpEmitPoly(GrVertex* v, int count)
 
 //------------------------------------------------------------------------------------------------------------------------
 
+/* Console `mixshader 0|1`. Ok is set at startup only if the program built. */
+extern "C" { int g_PsxMixedShader = 1; int g_PsxMixedShaderOk = 0; }
+
 static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_DISABLED)
 {
 	int tpage = activeDrawEnv.tpage;
@@ -3143,6 +3201,16 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 	 * global: an ungated read would key untextured/white splits on override
 	 * state they never sample, fragmenting them once normal maps exist. */
 	TextureID normalTextureId = (textured && overrideTexture != 0) ? overrideNormalTexture : 0;
+
+	/* Every VRAM format and untextured prims share one program, so only a
+	 * hi-res override (its own texture) still splits on texture. Tpage format
+	 * 3 is reserved and keeps its old path. */
+	const int mixed = (g_PsxMixedShader && g_PsxMixedShaderOk && (!textured || texFormat <= TF_16_BIT)) ? 1 : 0;
+	if (mixed)
+	{
+		texFormat = TF_16_BIT;
+		textureId = g_vramTexture;
+	}
 
 	// FIXME: compare drawing environment too?
 	if (curSplit.kind == GPU_SPLIT_LEGACY &&
@@ -3167,6 +3235,7 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 		curSplit.drawenv.clip.h == activeDrawEnv.clip.h &&
 		curSplit.drawenv.dfe == activeDrawEnv.dfe &&
 		curSplit.isGlyph == (textured ? s_curPrimIsGlyph : 0) &&
+		curSplit.mixed == mixed &&
 		curSplit.debugText == currentSplitDebugText)
 	{
 		return;
@@ -3201,6 +3270,7 @@ static void AddSplit(bool semiTrans, bool textured, int depthMode = SPLIT_DEPTH_
 	split.dispenv = activeDispEnv;
 	split.debugText = currentSplitDebugText;
 	split.isGlyph   = textured ? s_curPrimIsGlyph : 0;
+	split.mixed     = mixed;
 
 	split.drawenv.tw.w = overrideTextureWidth;
 	split.drawenv.tw.h = overrideTextureHeight;
@@ -3304,7 +3374,10 @@ void DrawSplit(const GPUDrawSplit& split)
 	GR_SetStencilMode(split.drawPrimMode);	// draw with mask 0x16
 
 	g_PsxSplitIsGlyph = split.isGlyph;
-	GR_SetTexture(split.textureId, split.texFormat);
+	if (split.mixed)
+		GR_SetTextureMixed(split.textureId);
+	else
+		GR_SetTexture(split.textureId, split.texFormat);
 
 	if (split.texFormat == TF_32_BIT_RGBA)
 		GR_SetOverrideTextureSize(split.drawenv.tw.w, split.drawenv.tw.h,

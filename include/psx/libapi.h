@@ -27,6 +27,31 @@ extern void UnDeliverEvent(unsigned int ev1, int ev2);
 extern int OpenTh(int (*func)(), unsigned int, unsigned int);
 extern int CloseTh(int unk00);
 extern int ChangeTh(int unk00);
+
+/* A wasm build links libc statically into the same module as this, so these
+ * PSX names would bind libc's OWN internal calls too -- opendir() opening a
+ * directory through the memory-card open() below. Every platform with a
+ * shared libc keeps those calls inside libc and never sees the clash. Give
+ * the PSX API its own spelling here; libapi.c and the game's callers both
+ * include this header, so neither side changes. rename takes const to stay
+ * compatible with the <stdio.h> declaration that the macro also renames.
+ * Function-like so a struct member named `read` is left alone. */
+#if defined(__EMSCRIPTEN__)
+#define open(...) PsyX_PsxOpen(__VA_ARGS__)
+#define close(...) PsyX_PsxClose(__VA_ARGS__)
+#define lseek(...) PsyX_PsxLseek(__VA_ARGS__)
+#define read(...) PsyX_PsxRead(__VA_ARGS__)
+#define write(...) PsyX_PsxWrite(__VA_ARGS__)
+#define ioctl(...) PsyX_PsxIoctl(__VA_ARGS__)
+#define rename(...) PsyX_PsxRename(__VA_ARGS__)
+extern int open(char* path, unsigned int flags);
+extern int close(int handle);
+extern int lseek(int handle, int offset, int whence);
+extern int read(int handle, void* buf, int bytes);
+extern int write(int handle, void* buf, int bytes);
+extern int ioctl(int unk00, int unk01, int unk02);
+extern int rename(const char* oldpath, const char* newpath);
+#endif
 	
 /*
 extern int open(char* unk00, unsigned int );

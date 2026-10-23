@@ -1313,6 +1313,14 @@ int GR_SetInternalResolution(int w, int h)
 {
 	GLenum st;
 
+	/* GR_InitialiseRender applies the render scale, and with it the present
+	 * size, before the window and context exist. Native drivers ignore GL
+	 * calls with no current context; WebGL's bindings throw. Nothing built
+	 * here could survive anyway: GR_InitialiseGLContext applies the present
+	 * size again once the context is up. */
+	if (SDL_GL_GetCurrentContext() == NULL)
+		return 0;
+
 	if (w <= 0 || h <= 0)
 	{
 		GR_DestroyInternalTarget();
@@ -8236,10 +8244,16 @@ void GR_UpdateVertexBuffer(const GrVertex* vertices, int num_vertices)
 		 * This is the one combination never tried: no orphan AND no ghost.
 		 * Earlier builds had the map but still orphaned on wrap, or dropped the
 		 * orphan but wrote with sub-data. Sub-data stays as the fallback. */
+#if defined(__EMSCRIPTEN__)
+		/* WebGL2 dropped buffer mapping outright (no CPU pointer into GPU
+		 * memory from a page), so the sub-data fallback is the only path. */
+		void* dst = NULL;
+#else
 		void* dst = glMapBufferRange ?
 			glMapBufferRange(GL_ARRAY_BUFFER, (GLintptr)offset, (GLsizeiptr)needed,
 			                 GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT |
 			                 GL_MAP_INVALIDATE_RANGE_BIT) : NULL;
+#endif
 
 		if (dst != NULL)
 		{

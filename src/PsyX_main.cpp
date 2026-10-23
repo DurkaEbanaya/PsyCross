@@ -161,30 +161,59 @@ int g_frameSkip = 0;
 
 #ifdef __EMSCRIPTEN__
 
-int g_emIntrInterval = -1;
-int g_intrVMode = MODE_NTSC;
-double g_emOldDate = 0;
+/* The page has no threads, so intrThreadMain's job runs from a browser timer
+ * instead: the same two clocks (vblank, RCnt2 for the BGM sequencer) and the
+ * same SPU envelope pump, caught up from elapsed time on every wake because a
+ * page timer fires at 4 ms at best and not at all while main is busy. It only
+ * ever runs while main is parked in an Asyncify sleep -- the vsync wait that
+ * is waiting on exactly this. Started unconditionally: the USA disc never
+ * calls SetVideoMode, so a loop started from there never ran. */
+static double s_emNextVbl   = 0.0;
+static double s_emNextRcnt2 = 0.0;
+static int    s_emRcnt2Armed = 0;
 
-void emIntrCallback(void* userData)
+static EM_BOOL emIntrPump(double time, void* userData)
 {
-	double timestep = g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL;
+	const double rcnt2Period = 1.0 / 577.8;
+	const double timestep    = g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL;
+	const double now         = Util_GetHPCTime(&g_vblTimer, 0);
+	int          n;
 
-	int newVBlank = (Util_GetHPCTime(&g_vblTimer, 0) / timestep) + g_frameSkip;
+	(void)time; (void)userData;
 
-	int diff = newVBlank - g_psxSysCounters[PsxCounter_VBLANK];
-
-	while (diff--)
+	/* Bounded catch-up: a tab returning from the background must not replay
+	 * minutes of vblanks in one go. */
+	for (n = 0; now >= s_emNextVbl && n < 4; n++)
 	{
 		if (vsync_callback)
 			vsync_callback();
 
 		g_psxSysCounters[PsxCounter_VBLANK]++;
+		s_emNextVbl += timestep;
 	}
-}
+	if (s_emNextVbl <= now)
+		s_emNextVbl = now + timestep;
 
-EM_BOOL emIntrCallback2(double time, void* userData)
-{
-	emIntrCallback(userData);
+	if (g_rcnt2_timer_active)
+	{
+		if (!s_emRcnt2Armed)
+		{
+			s_emRcnt2Armed = 1;
+			s_emNextRcnt2  = now;
+		}
+		for (n = 0; now >= s_emNextRcnt2 && n < 64; n++)
+		{
+			PsyX_PumpRCnt2Timer();
+			s_emNextRcnt2 += rcnt2Period;
+		}
+		if (s_emNextRcnt2 <= now)
+			s_emNextRcnt2 = now + rcnt2Period;
+	}
+	else
+		s_emRcnt2Armed = 0;
+
+	PsyX_SPUAL_Update();
+
 	return g_stopIntrThread ? EM_FALSE : EM_TRUE;
 }
 
@@ -194,20 +223,6 @@ int PsyX_Sys_SetVMode(int mode)
 {
 	int old = g_vmode;
 	g_vmode = mode;
-
-#ifdef __EMSCRIPTEN__
-	if (old != g_vmode)
-	{
-		//if(g_emIntrInterval != -1)
-		//	emscripten_clear_interval(g_emIntrInterval);
-		g_stopIntrThread = 1;
-
-		emscripten_sleep(100);
-
-		g_stopIntrThread = 0;
-		emscripten_set_timeout_loop(emIntrCallback2, 1.0, NULL);
-	}
-#endif
 
 	return old;
 }
@@ -368,6 +383,8 @@ static int PsyX_Sys_InitialiseCore()
 {
 #ifdef __EMSCRIPTEN__
 	Util_InitHPCTimer(&g_vblTimer);
+	s_emNextVbl = g_vmode == MODE_NTSC ? FIXED_TIME_STEP_NTSC : FIXED_TIME_STEP_PAL;
+	emscripten_set_timeout_loop(emIntrPump, 1.0, NULL);
 #else
 
 	g_intrThread = SDL_CreateThread(intrThreadMain, "psyX_intr", NULL);
@@ -884,7 +901,10 @@ void PsyX_Initialise(char* appName, int width, int height, int fullscreen)
 	eprintinfo("Build date: %s:%s\n", PSYX_COMPILE_DATE, PSYX_COMPILE_TIME);
 
 #if defined(__EMSCRIPTEN__)
-	SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "0");
+	/* SDL_Delay must yield to the page, not spin: the FMV player paces its own
+	 * blocking loop with it, and a canvas frame is only presented when control
+	 * returns to the browser. The build links with -sASYNCIFY for this. */
+	SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "1");
 #endif
 	
 	/* Keep the display awake while the game runs.

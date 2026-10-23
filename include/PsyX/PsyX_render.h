@@ -26,8 +26,9 @@
 #   define RENDERER_OGLES
 #   define OGLES_VERSION (3)
 #elif defined(__EMSCRIPTEN__)
+/* WebGL2 is GLES 3.0, so the browser shares the phones' ES3 shader path. */
 #   define RENDERER_OGLES
-#   define OGLES_VERSION (2)
+#   define OGLES_VERSION (3)
 #elif defined(__ANDROID__)
 #   define RENDERER_OGLES
 #   define OGLES_VERSION (3)
@@ -65,7 +66,8 @@
 #   include "common/glad.h"
 #else
 #   ifdef __EMSCRIPTEN__
-#      include <GL/gl.h>
+#      include <GLES3/gl3.h>
+#      include <GLES2/gl2ext.h>
 #   elif defined(PSYX_IOS)
 /* Apple ships GLES under its own framework layout, not the Khronos paths. */
 #      include <OpenGLES/ES3/gl.h>
@@ -99,7 +101,7 @@
 /* Android compiles against the NDK's <GLES3/gl3.h>, which is ES 3.0 and lacks
  * these for exactly the same reason Apple's framework does -- the guard names
  * iOS only because iOS hit it first. */
-#if defined(PSYX_IOS) || defined(__ANDROID__)
+#if defined(PSYX_IOS) || defined(__ANDROID__) || defined(__EMSCRIPTEN__)
 #   ifndef GL_TEXTURE_WIDTH
 #       define GL_TEXTURE_WIDTH         0x1000
 #   endif

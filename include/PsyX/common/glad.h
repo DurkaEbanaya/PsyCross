@@ -54,7 +54,8 @@ extern unsigned int g_PsyX_DefaultFBO;
 #   endif
 #endif
 
-#if defined(__ANDROID__)
+/* Emscripten's sysroot ships the same Khronos ES3 headers as the NDK. */
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
 #   include <GLES3/gl3.h>
 #   include <GLES2/gl2ext.h>
 #elif defined(__APPLE__) && TARGET_OS_IPHONE

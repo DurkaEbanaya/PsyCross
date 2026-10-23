@@ -10,11 +10,12 @@ list(REMOVE_ITEM PSYCROSS_SRCS_CPP
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/PsyX_SPUAL.cpp")
 
 # Neither mobile target has OpenAL: Android never had it, and Apple removed its
-# OpenAL framework. PsyX_SPUSoftware renders the SPU itself and pushes through
+# OpenAL framework. The web build takes the same path: one SDL audio sink is
+# all a browser page gets. PsyX_SPUSoftware renders the SPU itself and pushes through
 # SDL2's audio sink, so the legacy AL backend leaves the build here (before
 # add_library, or the removal would come too late to matter) and
 # PsyX_SPUDispatch.cpp collapses onto the software one via PSYX_NO_OPENAL.
-if(ANDROID OR IOS)
+if(ANDROID OR IOS OR EMSCRIPTEN)
 	list(REMOVE_ITEM PSYCROSS_SRCS_CPP
 		"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/PsyX_SPULegacy.cpp")
 	# PsyX_SPUSpatial.cpp routes the software SPU through OpenAL placement
@@ -80,7 +81,7 @@ if(NOT WIN32)
         PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")
 endif()
 
-if(ANDROID OR IOS)
+if(ANDROID OR IOS OR EMSCRIPTEN)
     # SDL2 is built from source alongside this (android_port/app/jni and
     # ios_port/CMakeLists.txt each add the submodule before us), so the target
     # already exists — find_package would look for a system SDL2 that an NDK
@@ -98,6 +99,8 @@ endif()
 if(ANDROID)
     target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
     target_link_libraries(psycross_static GLESv3 EGL android log)
+elseif(EMSCRIPTEN)
+    target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
 elseif(IOS)
     target_compile_definitions(psycross_static PUBLIC PSYX_NO_OPENAL)
     # iOS reaches GLES through a framework, and has no EGL — SDL creates the

@@ -31,6 +31,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <SDL.h>
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/html5.h>
+#endif
 
 #include <exception>
 
@@ -1107,6 +1110,7 @@ void PsyX_Sys_DoPollEvent()
 						extern int g_surfaceWidth, g_surfaceHeight;
 						extern void GR_ApplyRenderScale(void);
 
+						eprintinfo("[RESIZE] surface %dx%d\n", event.window.data1, event.window.data2);
 						g_surfaceWidth  = event.window.data1;
 						g_surfaceHeight = event.window.data2;
 						GR_ApplyRenderScale();
@@ -1210,9 +1214,38 @@ void PsyX_Sys_DoPollEvent()
 				if(g_cfg_gameOnTextInput)
 					(g_cfg_gameOnTextInput)(event.text.text);
 				break;
-			}			
+			}
 		}
 	}
+
+#if defined(__EMSCRIPTEN__)
+	/* The canvas is sized by the page's CSS, and SDL only learns of a change from
+	 * the window's resize event. On phones that event does not always make it to
+	 * the game -- booted in portrait and turned, the canvas grew to landscape while
+	 * the scene kept rendering at the boot size, stretched across it. Comparing
+	 * against the CSS box every frame catches it whichever way it was missed. */
+	if (g_window)
+	{
+		extern int g_surfaceWidth, g_surfaceHeight;
+		double cssW = 0.0, cssH = 0.0;
+
+		if (emscripten_get_element_css_size("#canvas", &cssW, &cssH) == EMSCRIPTEN_RESULT_SUCCESS &&
+			(int)cssW > 0 && (int)cssH > 0 &&
+			((int)cssW != g_surfaceWidth || (int)cssH != g_surfaceHeight))
+		{
+			SDL_Event resized;
+
+			SDL_zero(resized);
+			resized.type            = SDL_WINDOWEVENT;
+			resized.window.event    = SDL_WINDOWEVENT_RESIZED;
+			resized.window.windowID = SDL_GetWindowID(g_window);
+			resized.window.data1    = (int)cssW;
+			resized.window.data2    = (int)cssH;
+			SDL_SetWindowSize(g_window, (int)cssW, (int)cssH);
+			SDL_PushEvent(&resized);
+		}
+	}
+#endif
 }
 
 char begin_scene_flag = 0;

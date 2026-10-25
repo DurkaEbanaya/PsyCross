@@ -1,3 +1,9 @@
+/* SDL's current MinGW headers also include io.h indirectly through wchar.h.
+ * Suppress its optional POSIX aliases in this TU: these names below are PSX
+ * memory-card APIs, not CRT open/read/write. The native _xxx APIs remain. */
+#if defined(__MINGW32__) && !defined(_NO_OLDNAMES)
+#define _NO_OLDNAMES
+#endif
 #include "psx/libapi.h"
 #include "psx/libmcrd.h"
 #include "psx/kernel.h"

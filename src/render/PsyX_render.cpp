@@ -1986,7 +1986,6 @@ int GR_InitialiseRender(char* windowName, int width, int height, int fullscreen)
 {
 	g_surfaceWidth  = width;
 	g_surfaceHeight = height;
-	GR_ApplyRenderScale();
 
 	/* Remember the request before SDL gets a chance to replace it. */
 	g_cfgRenderWidth    = width;
@@ -2093,7 +2092,9 @@ int GR_InitialiseRender(char* windowName, int width, int height, int fullscreen)
 		return 0;
 	}
 #endif
-	
+	/* Offscreen targets allocate GL textures/FBOs. Desktop glad function
+	 * pointers are not valid until both the context and loader exist. */
+	GR_ApplyRenderScale();
 	return 1;
 }
 
